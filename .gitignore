@@ -5,3 +5,6 @@ JIT_ART
 **/*.pyc
 **/*.swn
 tools/boot.out
+compile_commands.json
+.vscode/
+.cache/

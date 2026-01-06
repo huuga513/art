@@ -23,10 +23,17 @@
 #include "android-base/macros.h"
 #include "android-base/strings.h"
 #include "cmdline.h"
-
+#include "dex/class_accessor.h"
+#include "dex/class_accessor-inl.h"
+#include "dex/class_accessor.h"
 #include "dex/dex_file_loader.h"
-#include "runtime.h"
+#include "dex/dex_file_structs.h"
+#include "dex/dex_instruction.h"
+#include "dex/dex_instruction-inl.h"
+#include "dex/dex_instruction_iterator.h"
+#include "dex/dex_instruction_utils.h"
 #include "runtime-inl.h"
+#include "runtime.h"
 
 namespace art {
 
@@ -80,7 +87,8 @@ struct OatCheckArgs : public CmdlineArgs {
       return kParseOk;
     }
 
-    if (dex_files_.empty() && oat_file_ == nullptr && system_dir_ == nullptr && apk_file_ == nullptr) {
+    if (dex_files_.empty() && oat_file_ == nullptr && system_dir_ == nullptr &&
+        apk_file_ == nullptr) {
       *error_msg = "At least one of --dex, --oat, --system, or --apk must be specified.";
       return kParseError;
     }
@@ -125,50 +133,79 @@ Options:
     return OatCheckMode::kDefault;
   }
 
-  // Extract all classes*.dex from APK into `dex_files_`.
-  bool ExtractDexFromApk(std::string* error_msg) {
-    if (apk_file_ == nullptr) {
-      return true;
-    }
-
-    // Create DexFileLoader with APK path as location
-    art::DexFileLoader loader(apk_file_, /*location=*/apk_file_);
-
-    std::vector<std::unique_ptr<const art::DexFile>> dex_files;
-
-    // Open all DEX files in the container (APK is a ZIP container)
-    bool success = loader.Open(
-        /*verify=*/true,
-        /*verify_checksum=*/true,
-        /*allow_no_dex_files=*/false,
-        error_msg,
-        &dex_files);
-
-    if (!success || dex_files.empty()) {
-      LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
-      return false;
-    }
-
-    LOG(INFO) << "Loaded " << dex_files.size() << " DEX file(s):\n";
-    for (size_t i = 0; i < dex_files.size(); ++i) {
-      const art::DexFile* dex = dex_files[i].get();
-      LOG(INFO) << "  [" << i << "] " << dex->GetLocation()
-          << " (" << dex->NumClassDefs() << " classes)\n";
-
-      // TODO: Add your validation logic here
-    }
-    return true;
-  }
 
   // Return list of DEX entry names inside the APK (e.g., "classes.dex")
-  const std::vector<std::string>& GetApkDexEntries() const {
-    return extracted_dex_names_;
-  }
+  const std::vector<std::string>& GetApkDexEntries() const { return extracted_dex_names_; }
 
  private:
   std::vector<std::string> extracted_dex_names_;
 };
 
+
+// Extract all classes*.dex from APK into `dex_files_`.
+bool ExtractDexFromApk(const char* apk_file,std::string* error_msg) {
+  if (apk_file == nullptr) {
+    return true;
+  }
+
+  // Create DexFileLoader with APK path as location
+  art::DexFileLoader loader(apk_file, /*location=*/apk_file);
+
+  std::vector<std::unique_ptr<const art::DexFile>> dex_files;
+
+  // Open all DEX files in the container (APK is a ZIP container)
+  bool success = loader.Open(
+      /*verify=*/true,
+      /*verify_checksum=*/true,
+      /*allow_no_dex_files=*/false,
+      error_msg,
+      &dex_files);
+
+  if (!success || dex_files.empty()) {
+    LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
+    return false;
+  }
+
+  LOG(INFO) << "Loaded " << dex_files.size() << " DEX file(s):\n";
+  for (size_t i = 0; i < dex_files.size(); ++i) {
+    const art::DexFile* dex = dex_files[i].get();
+    LOG(INFO) << "  [" << i << "] " << dex->GetLocation() << " (" << dex->NumClassDefs()
+              << " classes)\n";
+
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
+        for (auto it = code.begin(); it != code.end(); it++) {
+          DexInstructionPcPair inst = *it;
+          if (IsInstructionInvoke(inst->Opcode())) {
+            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
+            switch (invoke_type) {
+              case kDexInvokeVirtual: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* class_descriptor = dex->GetStringData(name_id);
+                LOG(INFO) << name_id.string_data_off_ << " " << class_descriptor;
+                break;
+              }
+              case kDexInvokeSuper:
+              case kDexInvokeDirect:
+              case kDexInvokeStatic:
+              case kDexInvokeInterface:
+                break;
+              default:
+                LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
+                              << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
+                break;
+            }
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
 struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
   bool ExecuteWithoutRuntime() override {
     LOG(FATAL) << "This tool requires ART runtime.";
@@ -182,7 +219,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Handle --apk: extract DEX entry names
     std::string error_msg;
-    if (!args_->ExtractDexFromApk(&error_msg)) {
+    if (!ExtractDexFromApk(args_->apk_file_,&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
     }
@@ -200,8 +237,10 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // TODO: Add real validation logic here.
     }
 
-    if (args_->oat_file_)   *os << "OAT: " << args_->oat_file_ << "\n";
-    if (args_->system_dir_) *os << "System: " << args_->system_dir_ << "\n";
+    if (args_->oat_file_)
+      *os << "OAT: " << args_->oat_file_ << "\n";
+    if (args_->system_dir_)
+      *os << "System: " << args_->system_dir_ << "\n";
 
     *os << "Done.\n";
     return true;

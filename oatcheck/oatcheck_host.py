@@ -35,12 +35,13 @@ def extract_art_invocation_args(asop_root: str) -> dict:
 
     return result
 
-def run_host(app: str, asop_root: str, *args):
+def run_host(app: str, asop_root: str, dbg:bool, *args):
     # 获取运行时参数
     runtime_args = extract_art_invocation_args(asop_root)
     
     # 设置基本命令及其参数
-    base_command = [app]
+    base_command = ["lldb", "--"] if dbg else []
+    base_command += [app]
     base_command += ["--runtime-arg", "-Xms64m"]
     base_command += ["--runtime-arg", "-Xmx512m"]
     base_command += ["--runtime-arg", f"-Xbootclasspath:{runtime_args.get('BOOT_CLASS_PATH', '')}"]
@@ -53,6 +54,8 @@ def run_host(app: str, asop_root: str, *args):
     # 添加额外的命令行参数
     command = base_command + list(args)
 
+    print(" ".join(command))
+
     # 执行命令并传递控制权
     try:
         subprocess.run(command, cwd=config["AOSP_ROOT"], check=True)
@@ -61,4 +64,4 @@ def run_host(app: str, asop_root: str, *args):
 
 if __name__ == "__main__":
     import sys
-    run_host("oatcheck", config["AOSP_ROOT"], *sys.argv[1:])
+    run_host("oatcheck", config["AOSP_ROOT"],False, *sys.argv[1:])

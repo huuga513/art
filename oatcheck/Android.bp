@@ -66,7 +66,8 @@ art_cc_binary {
                 "libbase",
                 "libdexfile",
                 "libprofile",
-                "liblog"
+                "liblog",
+                "libziparchive",
             ],
             static_libs: [
                 "libelffile",
@@ -121,6 +122,7 @@ art_cc_binary {
                 "libbase",
                 "libdexfiled",
                 "libprofiled",
+                "libziparchive",
             ],
             static_libs: [
                 "libelffiled",

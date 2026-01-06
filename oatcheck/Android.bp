@@ -1,0 +1,139 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_performance",
+}
+
+cc_defaults {
+    name: "oatcheck-defaults",
+    defaults: [ "art_defaults" ],
+    host_supported: true,
+    srcs: [
+        "oatcheck.cc",
+    ],
+    header_libs: [
+        "art_cmdlineparser_headers",
+    ],
+}
+
+// Collect all the static defaults and build a host-only static library, which
+// is then used for the (mostly) static host oatcheck binary.
+art_cc_library_static {
+    name: "liboatcheck_static",
+    device_supported: false,
+    host_supported: true,
+    defaults: [
+        "libart-disassembler_static_defaults",
+        "libart_static_defaults",
+        "libartbase_static_defaults",
+        "libdexfile_static_defaults",
+        "libprofile_static_defaults",
+        "oatcheck-defaults",
+    ],
+    whole_static_libs: [
+        "libbase",
+        "liblog"
+    ],
+}
+
+art_cc_binary {
+    name: "oatcheck",
+    defaults: ["oatcheck-defaults"],
+
+    target: {
+        android: {
+            shared_libs: [
+                "libart",
+                "libart-disassembler",
+                "libartbase",
+                "libbase",
+                "libdexfile",
+                "libprofile",
+                "liblog"
+            ],
+            static_libs: [
+                "libelffile",
+            ],
+        },
+        host: {
+            // Make the host binary static, except for system libraries.
+            static_libs: ["liboatcheck_static"],
+            stl: "c++_static",
+        },
+    },
+
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+        "test_broken_com.android.art",
+    ],
+}
+
+// Collect all the static defaults and build a host-only static library, which
+// is then used for the (mostly) static host art man binary.
+art_cc_library_static {
+    name: "liboatcheckd_static",
+    device_supported: false,
+    host_supported: true,
+    defaults: [
+        "libartd-disassembler_static_defaults",
+        "libartd_static_defaults",
+        "libartbased_static_defaults",
+        "libdexfiled_static_defaults",
+        "libprofiled_static_defaults",
+        "oatcheck-defaults",
+    ],
+    whole_static_libs: [
+        "libbase",
+    ],
+}
+
+art_cc_binary {
+    name: "oatcheckd",
+    defaults: [
+        "art_debug_defaults",
+        "oatcheck-defaults",
+    ],
+
+    target: {
+        android: {
+            shared_libs: [
+                "libartbased",
+                "libartd",
+                "libartd-disassembler",
+                "libbase",
+                "libdexfiled",
+                "libprofiled",
+            ],
+            static_libs: [
+                "libelffiled",
+            ],
+        },
+        host: {
+            // Make the host binary static, except for system libraries.
+            static_libs: ["liboatcheckd_static"],
+            stl: "c++_static",
+        },
+    },
+
+    apex_available: [
+        "com.android.art.debug",
+    ],
+}

@@ -24,12 +24,9 @@
 #include "android-base/strings.h"
 #include "cmdline.h"
 
+#include "dex/dex_file_loader.h"
 #include "runtime.h"
 #include "runtime-inl.h"
-
-// For APK (ZIP) parsing
-#include "ziparchive/zip_archive.h"
-#include "ziparchive/zip_writer.h"
 
 namespace art {
 
@@ -134,47 +131,32 @@ Options:
       return true;
     }
 
-    ZipArchiveHandle handle;
-    int32_t open_status = OpenArchive(apk_file_, &handle);
-    if (open_status != 0) {
-      *error_msg = "Failed to open APK: " + std::string(apk_file_) + " (" +
-                   ErrorCodeString(open_status) + ")";
-      CloseArchive(handle);
+    // Create DexFileLoader with APK path as location
+    art::DexFileLoader loader(apk_file_, /*location=*/apk_file_);
+
+    std::vector<std::unique_ptr<const art::DexFile>> dex_files;
+
+    // Open all DEX files in the container (APK is a ZIP container)
+    bool success = loader.Open(
+        /*verify=*/true,
+        /*verify_checksum=*/true,
+        /*allow_no_dex_files=*/false,
+        error_msg,
+        &dex_files);
+
+    if (!success || dex_files.empty()) {
+      LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
       return false;
     }
 
-    std::vector<ZipEntry> entries;
-    void* cookie;
-    int status = StartIteration(handle, &cookie, "", "");
-    if (status != 0) {
-      *error_msg = "Failed to start ZIP iteration";
-      CloseArchive(handle);
-      return false;
-    }
+    LOG(INFO) << "Loaded " << dex_files.size() << " DEX file(s):\n";
+    for (size_t i = 0; i < dex_files.size(); ++i) {
+      const art::DexFile* dex = dex_files[i].get();
+      LOG(INFO) << "  [" << i << "] " << dex->GetLocation()
+          << " (" << dex->NumClassDefs() << " classes)\n";
 
-    ZipEntry entry;
-    std::string name;
-    while (Next(cookie, &entry, &name) == 0) {
-      if (android::base::StartsWith(name, "classes") &&
-          android::base::EndsWith(name, ".dex")) {
-        // Store the full path as a temporary string? Not needed here.
-        // We'll re-open the APK later when loading DEX.
-        // Just record the name for now.
-        extracted_dex_names_.push_back(name);
-      }
+      // TODO: Add your validation logic here
     }
-    EndIteration(cookie);
-    CloseArchive(handle);
-
-    if (extracted_dex_names_.empty()) {
-      *error_msg = "No DEX files found in APK: " + std::string(apk_file_);
-      return false;
-    }
-
-    if (verbose_) {
-      LOG(INFO) << "Found " << extracted_dex_names_.size() << " DEX files in APK.";
-    }
-
     return true;
   }
 
@@ -186,22 +168,6 @@ Options:
  private:
   std::vector<std::string> extracted_dex_names_;
 };
-
-// Helper: Load DEX from APK entry (used in ExecuteWithRuntime)
-// static std::unique_ptr<const DexFile> OpenDexFromApk(const char* apk_path,
-                                                     // const std::string& entry_name,
-                                                     // std::string* error_msg) {
-  // std::vector<std::unique_ptr<const DexFile>> dex_files;
-  // if (!DexFile::Open(apk_path, entry_name, /*verify_checksum*/ true, error_msg, &dex_files)) {
-    // return nullptr;
-  // }
-  // if (dex_files.empty()) {
-    // *error_msg = "No DEX loaded from " + entry_name;
-    // return nullptr;
-  // }
-  // // Assume single DEX per entry (normal case)
-  // return std::move(dex_files[0]);
-// }
 
 struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
   bool ExecuteWithoutRuntime() override {
@@ -233,22 +199,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "Processing DEX: " << dex << "\n";
       // TODO: Add real validation logic here.
     }
-
-    // Process DEX files from APK
-    // for (const std::string& entry : args_->GetApkDexEntries()) {
-      // *os << "Processing DEX from APK (" << args_->apk_file_ << "): " << entry << "\n";
-
-      // // Optional: Actually load the DEX file using ART
-      // std::unique_ptr<const DexFile> dex = OpenDexFromApk(args_->apk_file_, entry, &error_msg);
-      // if (dex == nullptr) {
-        // LOG(WARNING) << "Failed to load " << entry << " from APK: " << error_msg;
-        // continue;
-      // }
-
-      // // Example: Print number of classes
-      // *os << "  -> Loaded " << dex->NumClassDefs() << " classes\n";
-      // // TODO: Your validation logic goes here.
-    // }
 
     if (args_->oat_file_)   *os << "OAT: " << args_->oat_file_ << "\n";
     if (args_->system_dir_) *os << "System: " << args_->system_dir_ << "\n";

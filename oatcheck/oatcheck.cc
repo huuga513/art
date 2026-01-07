@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -27,6 +28,7 @@
 #include "android-base/macros.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
+#include "class_status.h"
 #include "cmdline.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/class_accessor.h"
@@ -45,6 +47,7 @@
 #include "oat/stack_map.h"
 #include "runtime-inl.h"
 #include "runtime.h"
+#include "scoped_thread_state_change.h"
 namespace art {
 enum class DependencyType {
   kStaticFieldLayout,
@@ -111,6 +114,10 @@ class DependencyGraph {
   std::string Summary() const {
     return android::base::StringPrintf(
         "vecs:%zu edges:%zu", graph_.vertex_count(), graph_.edge_count());
+  }
+
+  const auto& GetVertices() const { 
+    return graph_.get_vertices();
   }
 
  private:
@@ -330,8 +337,14 @@ class OatFileAnalyzer {
 
         // inspired by DumpOatMethod
         for (const ClassAccessor::Method& method : accessor.GetMethods()) {
-          uint32_t code_offset = oat_class.GetOatMethod(class_method_index).GetCodeOffset();
+          const OatFile::OatMethod oat_method = oat_class.GetOatMethod(class_method_index);
           class_method_index++;
+          const OatHeader& oat_header = oat_file_->GetOatHeader();
+          const OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
+          if (method_header == nullptr || method_header->GetCodeSize() == 0) {
+            // No code.
+            continue;
+          }
 
           uint32_t dex_method_idx = method.GetIndex();
           std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
@@ -348,12 +361,124 @@ class OatFileAnalyzer {
   std::unique_ptr<art::OatFile> oat_file_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
 };
-class InlineCallGraph {
+class InlineCallGraphNode {
+ public:
+  InlineCallGraphNode(const std::string& descriptor, bool is_effected) : descriptor_(descriptor), is_effected_(is_effected) {}
 
+  const std::string& GetDescriptor() const { return descriptor_; }
+  bool IsEffected() const { return is_effected_; }
+  void SetEffected(bool is_effected) { is_effected_ = is_effected; }  
+ private:
+  std::string descriptor_;
+  bool is_effected_;
+};
+class InlineCallGraphEdge {
+ public:
+  InlineCallGraphEdge() = default;
+ private:
+  // No additional data for now.
+};
+class InlineCallGraph {
+ public:
+  bool GetVertexIfExists(const std::string& descriptor, graaf::vertex_id_t* vertex_id) const {
+    auto it = descriptor_to_vertex_id_.find(descriptor);
+    if (it != descriptor_to_vertex_id_.end()) {
+      *vertex_id = it->second;
+      return true;
+    }
+    return false;
+  }
+  template <typename... Args>
+  std::enable_if_t<std::is_constructible_v<InlineCallGraphNode, Args&&...>, graaf::vertex_id_t>
+  GetOrAddVertexIfAbsent(Args&&... args) {
+    InlineCallGraphNode node(std::forward<Args>(args)...);
+    auto it = descriptor_to_vertex_id_.find(node.GetDescriptor());
+    if (it != descriptor_to_vertex_id_.end()) {
+      return it->second;
+    }
+    graaf::vertex_id_t vertex_id = graph_.add_vertex(node);
+    descriptor_to_vertex_id_[node.GetDescriptor()] = vertex_id;
+    return vertex_id;
+  }
+ private:
+  graaf::graph<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::UNDIRECTED> graph_;
+  std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
+  friend class InlineCallGraphBuilder;
 };
 class InlineCallGraphBuilder {
  public:
-  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header) {
+  InlineCallGraphBuilder(InlineCallGraph* graph, const art::OatFile* oat_file, const std::vector<std::unique_ptr<const art::DexFile>>& dex_files) : graph_(*graph), oat_file_(*oat_file), dex_files_(dex_files) {}
+  bool BuildGraph(std::string* error_msg) {
+    size_t dex_file_count = oat_file_.GetOatDexFiles().size();
+    for (size_t i = 0; i < dex_file_count; ++i) {
+      const art::OatDexFile* oat_dex_file = oat_file_.GetOatDexFiles()[i];
+      if (oat_dex_file == nullptr) {
+        continue;
+      }
+
+      const art::DexFile* dex_file = dex_files_[i].get();
+      if (dex_file->GetLocation() != oat_dex_file->GetDexFileLocation()) {
+        *error_msg = "DEX location mismatch between OAT and DEX files.";
+        LOG(ERROR) << *error_msg;
+        return false;
+      }
+      for (ClassAccessor accessor : dex_file->GetClasses()) {
+        const uint16_t class_def_index = accessor.GetClassDefIndex();
+        const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
+        uint32_t class_method_index = 0;
+
+        for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+          const OatFile::OatMethod oat_method = oat_class.GetOatMethod(class_method_index);
+          class_method_index++;
+          const OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
+          if (method_header == nullptr || method_header->GetCodeSize() == 0) {
+            // No code.
+            continue;
+          }
+
+          uint32_t dex_method_idx = method.GetIndex();
+          std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
+          std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
+          auto id = graph_.GetOrAddVertexIfAbsent(pretty_method, false);
+        }
+      }
+    }
+
+    for (size_t i = 0; i < dex_file_count; ++i) {
+      const art::OatDexFile* oat_dex_file = oat_file_.GetOatDexFiles()[i];
+      if (oat_dex_file == nullptr) {
+        continue;
+      }
+
+      const art::DexFile* dex_file = dex_files_[i].get();
+      if (dex_file->GetLocation() != oat_dex_file->GetDexFileLocation()) {
+        *error_msg = "DEX location mismatch between OAT and DEX files.";
+        LOG(ERROR) << *error_msg;
+        return false;
+      }
+      for (ClassAccessor accessor : dex_file->GetClasses()) {
+        const uint16_t class_def_index = accessor.GetClassDefIndex();
+        const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
+        uint32_t class_method_index = 0;
+
+        for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+          const OatFile::OatMethod oat_method = oat_class.GetOatMethod(class_method_index);
+          class_method_index++;
+          const OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
+          if (method_header == nullptr || method_header->GetCodeSize() == 0) {
+            // No code.
+            continue;
+          }
+          uint32_t dex_method_idx = method.GetIndex();
+          std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
+          std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
+          AnalyzeOatMethod(method_header, pretty_method);
+        }
+      }
+    }
+    return true;
+  }
+  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const std::string& current_method_name) {
     CodeInfo code_info(caller_header);
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
@@ -361,11 +486,28 @@ class InlineCallGraphBuilder {
           continue;
         }
         ArtMethod* callee = inline_info.GetArtMethod();
-        LOG(INFO) << "  Inlined callee: " << callee->GetDexMethodIndex();
+        ScopedObjectAccess soa(Thread::Current());
+        
+        graaf::vertex_id_t vertex_id_caller;
+        graaf::vertex_id_t vertex_id_callee;
+        if (!graph_.GetVertexIfExists(current_method_name, &vertex_id_caller)) {
+          LOG(ERROR) << "Caller method not found in graph: " << current_method_name;
+          return false;
+        }
+        if (!graph_.GetVertexIfExists(callee->PrettyMethod(), &vertex_id_callee)) {
+          LOG(ERROR) << "Callee method not found in graph: " << callee->PrettyMethod();
+          return false;
+        }
+        std::string callee_method_name = callee->PrettyMethod();
+        graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
       }
     }
     return true;
   }
+  private:
+  InlineCallGraph& graph_;
+  const art::OatFile& oat_file_;
+  const std::vector<std::unique_ptr<const art::DexFile>>& dex_files_;
 };
 enum class OatCheckMode {
   kDefault,

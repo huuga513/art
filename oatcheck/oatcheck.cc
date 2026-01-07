@@ -297,10 +297,53 @@ class OatFileAnalyzer {
     }
     return true;
   }
+  // Returns a list of human-readable method descriptors for all methods
+  // in the OAT file that have compiled native code (i.e., non-null CompiledMethod).
+  // Format example: "java.lang.Object.toString:()Ljava/lang/String;"
+  bool GetCompiledMethodNames(/*out*/ std::vector<std::string>& method_names,
+                              /*out*/ std::string* error_msg) const {
+    if (!oat_file_) {
+      *error_msg = "OAT file is not loaded.";
+      return false;
+    }
+    // Iterate over all OatDexFile entries in the OAT file.
+    size_t dex_file_count = oat_file_->GetOatDexFiles().size();
+    for (size_t i = 0; i < dex_file_count; ++i) {
+      const art::OatDexFile* oat_dex_file = oat_file_->GetOatDexFiles()[i];
+      if (oat_dex_file == nullptr) {
+        continue;
+      }
+
+      const art::DexFile* dex_file = dex_files_[i].get();
+      if (dex_file->GetLocation() != oat_dex_file->GetDexFileLocation()) {
+        *error_msg = "DEX location mismatch between OAT and DEX files.";
+        LOG(ERROR) << *error_msg;
+        return false;
+      }
+      for (ClassAccessor accessor : dex_file->GetClasses()) {
+        const uint16_t class_def_index = accessor.GetClassDefIndex();
+        const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
+        uint32_t class_method_index = 0;
+
+        // inspired by DumpOatMethod
+        for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+          uint32_t code_offset = oat_class.GetOatMethod(class_method_index).GetCodeOffset();
+          class_method_index++;
+
+          uint32_t dex_method_idx = method.GetIndex();
+          std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
+          std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
+          method_names.push_back(pretty_method);
+        }
+      }
+    }
+    return true;
+  }
 
  private:
   const char* oat_file_path_;
   std::unique_ptr<art::OatFile> oat_file_;
+  std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
 };
 class InlineCallGraphBuilder {
  public:

@@ -37,9 +37,12 @@
 #include "dex/dex_instruction.h"
 #include "dex/dex_instruction_iterator.h"
 #include "dex/dex_instruction_utils.h"
+#include "graaflib/algorithm/topological_sorting/dfs_topological_sorting.h"
 #include "graaflib/graph.h"
 #include "graaflib/types.h"
-#include "graaflib/algorithm/topological_sorting/dfs_topological_sorting.h"
+#include "oat/oat_file.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "runtime-inl.h"
 #include "runtime.h"
 namespace art {
@@ -92,21 +95,22 @@ class DependencyGraph {
     return vertex_id;
   }
   void UpdateEdge(const std::string from_descriptor,
-                              const std::string to_descriptor,
-                              std::bitset<3> deps) {
+                  const std::string to_descriptor,
+                  std::bitset<3> deps) {
     graaf::vertex_id_t from_vertex_id = GetOrAddVertexIfAbsent(from_descriptor);
     graaf::vertex_id_t to_vertex_id = GetOrAddVertexIfAbsent(to_descriptor);
 
     if (graph_.has_edge(from_vertex_id, to_vertex_id)) {
       auto& edge = graph_.get_edge(from_vertex_id, to_vertex_id);
-      edge.SetDeps(edge.GetDeps()|deps);
+      edge.SetDeps(edge.GetDeps() | deps);
     } else {
       graph_.add_edge(from_vertex_id, to_vertex_id, DependencyGraphEdge(deps));
     }
   }
-  
+
   std::string Summary() const {
-    return android::base::StringPrintf("vecs:%zu edges:%zu", graph_.vertex_count(), graph_.edge_count());
+    return android::base::StringPrintf(
+        "vecs:%zu edges:%zu", graph_.vertex_count(), graph_.edge_count());
   }
 
  private:
@@ -118,15 +122,17 @@ class DependencyGraph {
 
 class DependencyGraphBuilder {
  public:
-  DependencyGraphBuilder(const char* apk_file_path, DependencyGraph* graph) : apk_file_path_(apk_file_path), graph_(*graph) {
-    // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in OAT.
+  DependencyGraphBuilder(const char* apk_file_path, DependencyGraph* graph)
+      : apk_file_path_(apk_file_path), graph_(*graph) {
+    // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in
+    // OAT.
   }
   bool BuildGraph(std::string* error_msg) {
     if (!ExtractDexFromApk(error_msg)) {
       return false;
     }
     for (const auto& dex : dex_files_) {
-      if(!AnalyzeDexMethods(dex.get(), error_msg)) {
+      if (!AnalyzeDexMethods(dex.get(), error_msg)) {
         LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
         return false;
       }
@@ -138,6 +144,7 @@ class DependencyGraphBuilder {
     LOG(INFO) << graph_.Summary();
     return true;
   }
+
  private:
   // Extract all classes*.dex from APK into `dex_files_`.
   bool ExtractDexFromApk(std::string* error_msg) {
@@ -147,7 +154,6 @@ class DependencyGraphBuilder {
 
     // Create DexFileLoader with APK path as location
     art::DexFileLoader loader(apk_file_path_, /*location=*/apk_file_path_);
-
 
     // Open all DEX files in the container (APK is a ZIP container)
     bool success = loader.Open(
@@ -166,81 +172,83 @@ class DependencyGraphBuilder {
     return true;
   }
   bool AnalyzeDexClasses(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
-      for (art::ClassAccessor accessor : dex->GetClasses()) {
-        const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
-        const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
-        const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
-        const char* class_descriptor = accessor.GetDescriptor();
-        graph_.UpdateEdge(superclass_descriptor, class_descriptor, std::bitset<3>(7));
-      }
-      return true;
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
+      const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
+      const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
+      const char* class_descriptor = accessor.GetDescriptor();
+      graph_.UpdateEdge(superclass_descriptor, class_descriptor, std::bitset<3>(7));
+    }
+    return true;
   }
   bool AnalyzeDexMethods(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
-      uint32_t count = 0;
-      for (art::ClassAccessor accessor : dex->GetClasses()) {
-        for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
-          const art::CodeItemInstructionAccessor& code = method.GetInstructions();
-          std::string method_name(dex->PrettyMethod(method.GetIndex()));
-          if (count++ > 10000) return true;
-          for (auto it = code.begin(); it != code.end(); it++) {
-            DexInstructionPcPair inst = *it;
-            if (IsInstructionInvoke(inst->Opcode())) {
-              DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
-              switch (invoke_type) {
-                case kDexInvokeVirtual: {
-                  auto method_idx = inst->VRegB();
-                  const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                  const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                  const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                  const char* class_descriptor = dex->GetStringData(name_id);
+    uint32_t count = 0;
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
+        std::string method_name(dex->PrettyMethod(method.GetIndex()));
+        if (count++ > 10000)
+          return true;
+        for (auto it = code.begin(); it != code.end(); it++) {
+          DexInstructionPcPair inst = *it;
+          if (IsInstructionInvoke(inst->Opcode())) {
+            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
+            switch (invoke_type) {
+              case kDexInvokeVirtual: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* class_descriptor = dex->GetStringData(name_id);
 
-                  graph_.UpdateEdge(class_descriptor,
-                                    method_name, 
-                                    std::bitset<3>(1 << static_cast<size_t>(
-                                        DependencyType::kVirtualTableLayout)));
-                  break;
-                }
-                case kDexInvokeSuper:
-                case kDexInvokeDirect:
-                case kDexInvokeStatic: {
-                  // TODO: If invoke target is from boot classpath, just set the method vertex as changed.
-                  break;
-                }
-                case kDexInvokeInterface:
-                  break;
-                default:
-                  LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
-                              << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
-                  break;
+                graph_.UpdateEdge(
+                    class_descriptor,
+                    method_name,
+                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
+                break;
               }
-            } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
-              auto field_idx = inst->VRegC();
-              const dex::FieldId& field_id = dex->GetFieldId(field_idx);
-              const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
-              const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-              const char* class_descriptor = dex->GetStringData(name_id);
-
-              graph_.UpdateEdge(class_descriptor,
-                                method_name,
-                                std::bitset<3>(1 << static_cast<size_t>(
-                                    DependencyType::kInstanceFieldLayout)));
-            } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
-              auto field_idx = inst->VRegB();
-              const dex::FieldId& field_id = dex->GetFieldId(field_idx);
-              const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
-              const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-              const char* class_descriptor = dex->GetStringData(name_id);
-
-              graph_.UpdateEdge(class_descriptor,
-                                method_name,
-                                std::bitset<3>(1 << static_cast<size_t>(
-                                    DependencyType::kStaticFieldLayout)));
+              case kDexInvokeSuper:
+              case kDexInvokeDirect:
+              case kDexInvokeStatic: {
+                // TODO: If invoke target is from boot classpath, just set the method vertex as
+                // changed.
+                break;
+              }
+              case kDexInvokeInterface:
+                break;
+              default:
+                LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
+                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
+                break;
             }
+          } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
+            auto field_idx = inst->VRegC();
+            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+
+            graph_.UpdateEdge(
+                class_descriptor,
+                method_name,
+                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
+          } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
+            auto field_idx = inst->VRegB();
+            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+
+            graph_.UpdateEdge(
+                class_descriptor,
+                method_name,
+                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
           }
         }
       }
-      return true;
     }
+    return true;
+  }
 
   const char* apk_file_path_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
@@ -250,26 +258,65 @@ class DependencyGraphBuilder {
 class DependencyGraphPropagator {
  public:
   DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
-  void SetInitialChanges(); //TODO: Set initial changes based on changed BCP classes.
+  void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
   void PropagateChanges() {
     auto& inner_graph = graph_.graph_;
-    auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(graph_.graph_);
+    auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(
+        graph_.graph_);
     if (!result.has_value()) {
       LOG(ERROR) << "Dependency graph has cycles!";
       return;
     }
     const std::vector<graaf::vertex_id_t>& topo = result.value();
     for (auto id : topo) {
-      for (auto succId: inner_graph.get_neighbors(id)) {
+      for (auto succId : inner_graph.get_neighbors(id)) {
         auto edge = inner_graph.get_edge(id, succId);
         auto& succ = inner_graph.get_vertex(succId);
         succ.changes_ |= edge.GetDeps() & inner_graph.get_vertex(id).changes_;
       }
     }
-
   }
-  private:
-    DependencyGraph& graph_;
+
+ private:
+  DependencyGraph& graph_;
+};
+
+class OatFileAnalyzer {
+ public:
+  OatFileAnalyzer(const char* oat_file_path) : oat_file_path_(oat_file_path) {}
+  bool LoadOatFile(std::string* error_msg) {
+    oat_file_.reset(OatFile::Open(/* zip_fd */ -1,
+                                  oat_file_path_,
+                                  oat_file_path_,
+                                  /* executable */ false,
+                                  /* low_4gb */ false,
+                                  error_msg));
+    if (oat_file_ == nullptr) {
+      LOG(ERROR) << "Failed to open OAT file: " << *error_msg;
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  const char* oat_file_path_;
+  std::unique_ptr<art::OatFile> oat_file_;
+};
+class InlineCallGraphBuilder {
+ public:
+  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header) {
+    CodeInfo code_info(caller_header);
+    for (const StackMap& stack_map : code_info.GetStackMaps()) {
+      for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
+        if (!inline_info.EncodesArtMethod()) {
+          continue;
+        }
+        ArtMethod* callee = inline_info.GetArtMethod();
+        LOG(INFO) << "  Inlined callee: " << callee->GetDexMethodIndex();
+      }
+    }
+    return true;
+  }
 };
 enum class OatCheckMode {
   kDefault,

@@ -24,6 +24,7 @@
 
 #include "android-base/logging.h"
 #include "android-base/macros.h"
+#include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 #include "cmdline.h"
 #include "dex/class_accessor-inl.h"
@@ -101,10 +102,128 @@ class DependencyGraph {
       graph_.add_edge(from_vertex_id, to_vertex_id, DependencyGraphEdge(deps));
     }
   }
+  
+  std::string Summary() const {
+    return android::base::StringPrintf("vecs:%zu edges:%zu", graph_.vertex_count(), graph_.edge_count());
+  }
 
  private:
   graaf::graph<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> graph_;
   std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
+};
+
+class DependencyGraphBuilder {
+ public:
+  DependencyGraphBuilder(const char* apk_file_path) : apk_file_path_(apk_file_path) {
+    // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in OAT.
+  }
+  bool BuildGraph(std::string* error_msg) {
+    if (!ExtractDexFromApk(error_msg)) {
+      return false;
+    }
+    for (const auto& dex : dex_files_) {
+      if(!AnalyzeDexMethods(dex.get(), error_msg)) {
+        LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
+        return false;
+      }
+    }
+    LOG(INFO) << graph_.Summary();
+    return true;
+  }
+ private:
+  // Extract all classes*.dex from APK into `dex_files_`.
+  bool ExtractDexFromApk(std::string* error_msg) {
+    if (apk_file_path_ == nullptr) {
+      return true;
+    }
+
+    // Create DexFileLoader with APK path as location
+    art::DexFileLoader loader(apk_file_path_, /*location=*/apk_file_path_);
+
+
+    // Open all DEX files in the container (APK is a ZIP container)
+    bool success = loader.Open(
+        /*verify=*/true,
+        /*verify_checksum=*/true,
+        /*allow_no_dex_files=*/false,
+        error_msg,
+        &dex_files_);
+
+    if (!success || dex_files_.empty()) {
+      LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
+      return false;
+    }
+
+    LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s):\n";
+    return true;
+  }
+  bool AnalyzeDexMethods(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
+      uint32_t count = 0;
+      for (art::ClassAccessor accessor : dex->GetClasses()) {
+        for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+          const art::CodeItemInstructionAccessor& code = method.GetInstructions();
+          std::string method_name(dex->PrettyMethod(method.GetIndex()));
+          if (count++ > 10000) return true;
+          for (auto it = code.begin(); it != code.end(); it++) {
+            DexInstructionPcPair inst = *it;
+            if (IsInstructionInvoke(inst->Opcode())) {
+              DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
+              switch (invoke_type) {
+                case kDexInvokeVirtual: {
+                  auto method_idx = inst->VRegB();
+                  const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                  const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                  const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                  const char* class_descriptor = dex->GetStringData(name_id);
+
+                  graph_.UpdateEdge(class_descriptor,
+                                    method_name, 
+                                    std::bitset<3>(1 << static_cast<size_t>(
+                                        DependencyType::kVirtualTableLayout)));
+                  break;
+                }
+                case kDexInvokeSuper:
+                case kDexInvokeDirect:
+                case kDexInvokeStatic:
+                case kDexInvokeInterface:
+                  break;
+                default:
+                  LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
+                              << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
+                  break;
+              }
+            } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
+              auto field_idx = inst->VRegC();
+              const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+              const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+              const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+              const char* class_descriptor = dex->GetStringData(name_id);
+
+              graph_.UpdateEdge(class_descriptor,
+                                method_name,
+                                std::bitset<3>(1 << static_cast<size_t>(
+                                    DependencyType::kInstanceFieldLayout)));
+            } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
+              auto field_idx = inst->VRegB();
+              const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+              const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+              const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+              const char* class_descriptor = dex->GetStringData(name_id);
+
+              graph_.UpdateEdge(class_descriptor,
+                                method_name,
+                                std::bitset<3>(1 << static_cast<size_t>(
+                                    DependencyType::kStaticFieldLayout)));
+            }
+          }
+        }
+      }
+      return true;
+    }
+
+  const char* apk_file_path_;
+  std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
+  DependencyGraph graph_;
 };
 
 enum class OatCheckMode {
@@ -218,70 +337,6 @@ void preprocess_changed_app_classes(art::DexFile* dex) {
     changed_bcp_classes_descriptors.insert(std::string(descriptor));
   }
 }
-// Extract all classes*.dex from APK into `dex_files_`.
-bool ExtractDexFromApk(const char* apk_file, std::string* error_msg) {
-  if (apk_file == nullptr) {
-    return true;
-  }
-
-  // Create DexFileLoader with APK path as location
-  art::DexFileLoader loader(apk_file, /*location=*/apk_file);
-
-  std::vector<std::unique_ptr<const art::DexFile>> dex_files;
-
-  // Open all DEX files in the container (APK is a ZIP container)
-  bool success = loader.Open(
-      /*verify=*/true,
-      /*verify_checksum=*/true,
-      /*allow_no_dex_files=*/false,
-      error_msg,
-      &dex_files);
-
-  if (!success || dex_files.empty()) {
-    LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
-    return false;
-  }
-
-  LOG(INFO) << "Loaded " << dex_files.size() << " DEX file(s):\n";
-  for (size_t i = 0; i < dex_files.size(); ++i) {
-    const art::DexFile* dex = dex_files[i].get();
-    LOG(INFO) << "  [" << i << "] " << dex->GetLocation() << " (" << dex->NumClassDefs()
-              << " classes)\n";
-
-    for (art::ClassAccessor accessor : dex->GetClasses()) {
-      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
-        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
-        for (auto it = code.begin(); it != code.end(); it++) {
-          DexInstructionPcPair inst = *it;
-          if (IsInstructionInvoke(inst->Opcode())) {
-            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
-            switch (invoke_type) {
-              case kDexInvokeVirtual: {
-                auto method_idx = inst->VRegB();
-                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* class_descriptor = dex->GetStringData(name_id);
-                LOG(INFO) << name_id.string_data_off_ << " " << class_descriptor;
-                break;
-              }
-              case kDexInvokeSuper:
-              case kDexInvokeDirect:
-              case kDexInvokeStatic:
-              case kDexInvokeInterface:
-                break;
-              default:
-                LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
-                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
-                break;
-            }
-          }
-        }
-      }
-    }
-  }
-  return true;
-}
 struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
   bool ExecuteWithoutRuntime() override {
     LOG(FATAL) << "This tool requires ART runtime.";
@@ -295,7 +350,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Handle --apk: extract DEX entry names
     std::string error_msg;
-    if (!ExtractDexFromApk(args_->apk_file_, &error_msg)) {
+    DependencyGraphBuilder graph_builder(args_->apk_file_);
+    if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
     }

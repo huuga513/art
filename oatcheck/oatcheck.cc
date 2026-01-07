@@ -15,6 +15,7 @@
  */
 
 #include <bitset>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -38,28 +39,29 @@
 #include "dex/dex_instruction_utils.h"
 #include "graaflib/graph.h"
 #include "graaflib/types.h"
+#include "graaflib/algorithm/topological_sorting/dfs_topological_sorting.h"
 #include "runtime-inl.h"
 #include "runtime.h"
 namespace art {
-
-class DependencyGraphNode {
- public:
-  DependencyGraphNode(std::string descriptor, bool is_changed = false)
-      : descriptor_(std::move(descriptor)), is_changed_(is_changed) {}
-
-  const std::string& GetDescriptor() const { return descriptor_; }
-  bool IsChanged() const { return is_changed_; }
-
- private:
-  std::string descriptor_;
-  bool is_changed_ = false;
-};
-
 enum class DependencyType {
   kStaticFieldLayout,
   kInstanceFieldLayout,
   kVirtualTableLayout,
   kDependencyTypeCount
+};
+
+class DependencyGraphNode {
+ public:
+  DependencyGraphNode(std::string descriptor, bool is_changed = false)
+      : descriptor_(std::move(descriptor)), changes_(is_changed) {}
+
+  const std::string& GetDescriptor() const { return descriptor_; }
+  bool IsChanged() const { return changes_.any(); }
+
+ private:
+  std::string descriptor_;
+  std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)> changes_;
+  friend class DependencyGraphPropagator;
 };
 
 class DependencyGraphEdge {
@@ -111,6 +113,7 @@ class DependencyGraph {
   graaf::graph<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> graph_;
   std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
   friend class DependencyGraphBuilder;
+  friend class DependencyGraphPropagator;
 };
 
 class DependencyGraphBuilder {
@@ -244,6 +247,30 @@ class DependencyGraphBuilder {
   DependencyGraph& graph_;
 };
 
+class DependencyGraphPropagator {
+ public:
+  DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
+  void SetInitialChanges(); //TODO: Set initial changes based on changed BCP classes.
+  void PropagateChanges() {
+    auto& inner_graph = graph_.graph_;
+    auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(graph_.graph_);
+    if (!result.has_value()) {
+      LOG(ERROR) << "Dependency graph has cycles!";
+      return;
+    }
+    const std::vector<graaf::vertex_id_t>& topo = result.value();
+    for (auto id : topo) {
+      for (auto succId: inner_graph.get_neighbors(id)) {
+        auto edge = inner_graph.get_edge(id, succId);
+        auto& succ = inner_graph.get_vertex(succId);
+        succ.changes_ |= edge.GetDeps() & inner_graph.get_vertex(id).changes_;
+      }
+    }
+
+  }
+  private:
+    DependencyGraph& graph_;
+};
 enum class OatCheckMode {
   kDefault,
   kVerbose,

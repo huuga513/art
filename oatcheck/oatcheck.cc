@@ -110,11 +110,12 @@ class DependencyGraph {
  private:
   graaf::graph<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> graph_;
   std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
+  friend class DependencyGraphBuilder;
 };
 
 class DependencyGraphBuilder {
  public:
-  DependencyGraphBuilder(const char* apk_file_path) : apk_file_path_(apk_file_path) {
+  DependencyGraphBuilder(const char* apk_file_path, DependencyGraph* graph) : apk_file_path_(apk_file_path), graph_(*graph) {
     // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in OAT.
   }
   bool BuildGraph(std::string* error_msg) {
@@ -198,7 +199,10 @@ class DependencyGraphBuilder {
                 }
                 case kDexInvokeSuper:
                 case kDexInvokeDirect:
-                case kDexInvokeStatic:
+                case kDexInvokeStatic: {
+                  // TODO: If invoke target is from boot classpath, just set the method vertex as changed.
+                  break;
+                }
                 case kDexInvokeInterface:
                   break;
                 default:
@@ -237,7 +241,7 @@ class DependencyGraphBuilder {
 
   const char* apk_file_path_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
-  DependencyGraph graph_;
+  DependencyGraph& graph_;
 };
 
 enum class OatCheckMode {
@@ -364,7 +368,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Handle --apk: extract DEX entry names
     std::string error_msg;
-    DependencyGraphBuilder graph_builder(args_->apk_file_);
+    DependencyGraph graph;
+    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;

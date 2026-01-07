@@ -31,6 +31,9 @@ cc_defaults {
     header_libs: [
         "art_cmdlineparser_headers",
     ],
+    local_include_dirs:[
+        "include"
+    ],
 }
 
 // Collect all the static defaults and build a host-only static library, which

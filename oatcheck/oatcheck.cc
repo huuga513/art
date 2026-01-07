@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -26,6 +27,7 @@
 #include "dex/class_accessor.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/class_accessor.h"
+#include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 #include "dex/dex_file_structs.h"
 #include "dex/dex_instruction.h"
@@ -35,6 +37,7 @@
 #include "runtime-inl.h"
 #include "runtime.h"
 
+#include "graaflib/graph.h"
 namespace art {
 
 enum class OatCheckMode {
@@ -141,7 +144,14 @@ Options:
   std::vector<std::string> extracted_dex_names_;
 };
 
-
+std::unordered_set<std::string> changed_bcp_classes_descriptors;
+void preprocess_changed_app_classes(art::DexFile* dex) {
+  for (uint32_t i = 0; i < dex->NumTypeIds(); ++i) {
+    const art::dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(i));
+    const char* descriptor = dex->GetStringData(type_id.descriptor_idx_);
+    changed_bcp_classes_descriptors.insert(std::string(descriptor));
+  }
+}
 // Extract all classes*.dex from APK into `dex_files_`.
 bool ExtractDexFromApk(const char* apk_file,std::string* error_msg) {
   if (apk_file == nullptr) {

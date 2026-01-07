@@ -14,31 +14,100 @@
  * limitations under the License.
  */
 
+#include <bitset>
 #include <cstdint>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "android-base/logging.h"
 #include "android-base/macros.h"
 #include "android-base/strings.h"
 #include "cmdline.h"
-#include "dex/class_accessor.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/class_accessor.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 #include "dex/dex_file_structs.h"
-#include "dex/dex_instruction.h"
 #include "dex/dex_instruction-inl.h"
+#include "dex/dex_instruction.h"
 #include "dex/dex_instruction_iterator.h"
 #include "dex/dex_instruction_utils.h"
+#include "graaflib/graph.h"
+#include "graaflib/types.h"
 #include "runtime-inl.h"
 #include "runtime.h"
-
-#include "graaflib/graph.h"
 namespace art {
+
+class DependencyGraphNode {
+ public:
+  DependencyGraphNode(std::string descriptor, bool is_changed = false)
+      : descriptor_(std::move(descriptor)), is_changed_(is_changed) {}
+  ~DependencyGraphNode() = default;
+
+  const std::string& GetDescriptor() const { return descriptor_; }
+  bool IsChanged() const { return is_changed_; }
+
+ private:
+  std::string descriptor_;
+  bool is_changed_ = false;
+};
+
+enum class DependencyType {
+  kStaticFieldLayout,
+  kInstanceFieldLayout,
+  kVirtualTableLayout,
+  kDependencyTypeCount
+};
+
+class DependencyGraphEdge {
+ public:
+  DependencyGraphEdge(std::bitset<3> deps) : deps_(std::move(deps)) {}
+  ~DependencyGraphEdge() = default;
+
+  const std::bitset<3>& GetDeps() const { return deps_; }
+  void SetDeps(const std::bitset<3>& deps) { deps_ = deps; }
+
+ private:
+  std::bitset<3> deps_;
+};
+
+class DependencyGraph {
+ public:
+  DependencyGraph() = default;
+  ~DependencyGraph() = default;
+  template <typename... Args>
+  std::enable_if_t<std::is_constructible_v<DependencyGraphNode, Args&&...>, graaf::vertex_id_t>
+  GetOrAddVertexIfAbsent(Args&&... args) {
+    DependencyGraphNode node(std::forward<Args>(args)...);
+    auto it = descriptor_to_vertex_id_.find(node.GetDescriptor());
+    if (it != descriptor_to_vertex_id_.end()) {
+      return it->second;
+    }
+    graaf::vertex_id_t vertex_id = graph_.add_vertex(node);
+    descriptor_to_vertex_id_[node.GetDescriptor()] = vertex_id;
+    return vertex_id;
+  }
+  void UpdateEdge(const std::string from_descriptor,
+                              const std::string to_descriptor,
+                              std::bitset<3> deps) {
+    graaf::vertex_id_t from_vertex_id = GetOrAddVertexIfAbsent(from_descriptor);
+    graaf::vertex_id_t to_vertex_id = GetOrAddVertexIfAbsent(to_descriptor);
+
+    if (graph_.has_edge(from_vertex_id, to_vertex_id)) {
+      auto& edge = graph_.get_edge(from_vertex_id, to_vertex_id);
+      edge.SetDeps(edge.GetDeps()|deps);
+    } else {
+      graph_.add_edge(from_vertex_id, to_vertex_id, DependencyGraphEdge(deps));
+    }
+  }
+
+ private:
+  graaf::graph<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> graph_;
+  std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
+};
 
 enum class OatCheckMode {
   kDefault,
@@ -136,7 +205,6 @@ Options:
     return OatCheckMode::kDefault;
   }
 
-
   // Return list of DEX entry names inside the APK (e.g., "classes.dex")
   const std::vector<std::string>& GetApkDexEntries() const { return extracted_dex_names_; }
 
@@ -153,7 +221,7 @@ void preprocess_changed_app_classes(art::DexFile* dex) {
   }
 }
 // Extract all classes*.dex from APK into `dex_files_`.
-bool ExtractDexFromApk(const char* apk_file,std::string* error_msg) {
+bool ExtractDexFromApk(const char* apk_file, std::string* error_msg) {
   if (apk_file == nullptr) {
     return true;
   }
@@ -206,7 +274,7 @@ bool ExtractDexFromApk(const char* apk_file,std::string* error_msg) {
                 break;
               default:
                 LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
-                              << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
+                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
                 break;
             }
           }
@@ -229,7 +297,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Handle --apk: extract DEX entry names
     std::string error_msg;
-    if (!ExtractDexFromApk(args_->apk_file_,&error_msg)) {
+    if (!ExtractDexFromApk(args_->apk_file_, &error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
     }

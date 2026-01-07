@@ -156,6 +156,7 @@ module_exports {
                 "oatdump",
                 "profman",
                 "veridex",
+                "oatcheck",
             ],
             native_libs: [
                 // libdexfile dependencies for host tests.

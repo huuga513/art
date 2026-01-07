@@ -172,6 +172,7 @@ class DependencyGraphBuilder {
     return true;
   }
   bool AnalyzeDexClasses(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
+    // Build dependency edges based on class hierarchy.
     for (art::ClassAccessor accessor : dex->GetClasses()) {
       const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
       const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
@@ -182,12 +183,13 @@ class DependencyGraphBuilder {
     return true;
   }
   bool AnalyzeDexMethods(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
+    // Build dependency edges based on method instructions.
     uint32_t count = 0;
     for (art::ClassAccessor accessor : dex->GetClasses()) {
       for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        if (count++ > 10000)
+        if (count++ > 10000) // TODO: remove me
           return true;
         for (auto it = code.begin(); it != code.end(); it++) {
           DexInstructionPcPair inst = *it;
@@ -260,6 +262,7 @@ class DependencyGraphPropagator {
   DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
   void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
   void PropagateChanges() {
+    // Propagate changes from the initial changed classes through the dependency graph.
     auto& inner_graph = graph_.graph_;
     auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(
         graph_.graph_);
@@ -344,6 +347,9 @@ class OatFileAnalyzer {
   const char* oat_file_path_;
   std::unique_ptr<art::OatFile> oat_file_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
+};
+class InlineCallGraph {
+
 };
 class InlineCallGraphBuilder {
  public:
@@ -465,13 +471,6 @@ Options:
 };
 
 std::unordered_set<std::string> changed_bcp_classes_descriptors;
-void preprocess_changed_app_classes(art::DexFile* dex) {
-  for (uint32_t i = 0; i < dex->NumTypeIds(); ++i) {
-    const art::dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(i));
-    const char* descriptor = dex->GetStringData(type_id.descriptor_idx_);
-    changed_bcp_classes_descriptors.insert(std::string(descriptor));
-  }
-}
 struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
   bool ExecuteWithoutRuntime() override {
     LOG(FATAL) << "This tool requires ART runtime.";

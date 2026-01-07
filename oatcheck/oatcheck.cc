@@ -45,7 +45,6 @@ class DependencyGraphNode {
  public:
   DependencyGraphNode(std::string descriptor, bool is_changed = false)
       : descriptor_(std::move(descriptor)), is_changed_(is_changed) {}
-  ~DependencyGraphNode() = default;
 
   const std::string& GetDescriptor() const { return descriptor_; }
   bool IsChanged() const { return is_changed_; }
@@ -65,7 +64,6 @@ enum class DependencyType {
 class DependencyGraphEdge {
  public:
   DependencyGraphEdge(std::bitset<3> deps) : deps_(std::move(deps)) {}
-  ~DependencyGraphEdge() = default;
 
   const std::bitset<3>& GetDeps() const { return deps_; }
   void SetDeps(const std::bitset<3>& deps) { deps_ = deps; }

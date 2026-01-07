@@ -126,6 +126,10 @@ class DependencyGraphBuilder {
         LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
         return false;
       }
+      if (!AnalyzeDexClasses(dex.get(), error_msg)) {
+        LOG(ERROR) << "Failed to analyze DEX classes: " << *error_msg;
+        return false;
+      }
     }
     LOG(INFO) << graph_.Summary();
     return true;
@@ -156,6 +160,16 @@ class DependencyGraphBuilder {
 
     LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s):\n";
     return true;
+  }
+  bool AnalyzeDexClasses(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
+      for (art::ClassAccessor accessor : dex->GetClasses()) {
+        const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
+        const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
+        const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
+        const char* class_descriptor = accessor.GetDescriptor();
+        graph_.UpdateEdge(superclass_descriptor, class_descriptor, std::bitset<3>(7));
+      }
+      return true;
   }
   bool AnalyzeDexMethods(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
       uint32_t count = 0;

@@ -35,12 +35,12 @@ def extract_art_invocation_args(asop_root: str) -> dict:
 
     return result
 
-def run_host(app: str, asop_root: str, dbg:bool, *args):
+def run_host(app: str, asop_root: str, mode, *args):
     # 获取运行时参数
     runtime_args = extract_art_invocation_args(asop_root)
     
     # 设置基本命令及其参数
-    base_command = ["lldb", "--"] if dbg else []
+    base_command = ["lldb", "--"] if mode == "debug" else ["perf", "record", "-g", "--"] if mode == "perf" else []
     base_command += [app]
     base_command += ["--runtime-arg", "-Xms64m"]
     base_command += ["--runtime-arg", "-Xmx512m"]
@@ -64,4 +64,5 @@ def run_host(app: str, asop_root: str, dbg:bool, *args):
 
 if __name__ == "__main__":
     import sys
-    run_host("oatcheck", config["AOSP_ROOT"],False, *sys.argv[1:])
+   # run_host("oatcheck", config["AOSP_ROOT"],"perf", *sys.argv[1:])
+    run_host("out/host/linux-x86/bin/oatcheck", config["AOSP_ROOT"],"perf", *sys.argv[1:])

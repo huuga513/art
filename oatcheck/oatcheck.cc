@@ -105,21 +105,36 @@ class DependencyGraphEdge {
  private:
   std::bitset<3> deps_;
 };
-
-class DependencyGraph {
- public:
-  DependencyGraph() = default;
-  ~DependencyGraph() = default;
+template <typename GraphNode, typename GraphEdge, graaf::graph_type GraphType>
+class GraphBase {
+public:
   template <typename... Args>
-  std::enable_if_t<std::is_constructible_v<DependencyGraphNode, Args&&...>, graaf::vertex_id_t>
+  requires std::is_constructible_v<GraphNode, Args&&...>
+  graaf::vertex_id_t
   AddVertexIfAbsent(DexSymId dex_sym_id, Args&&... args) {
     graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(dex_sym_id.id);
     if (graph_.has_vertex(vertex_id))
       return vertex_id;
-    DependencyGraphNode node(std::forward<Args>(args)...);
+    GraphNode node(std::forward<Args>(args)...);
     graph_.add_vertex(node, vertex_id);
     return vertex_id;
   }
+
+  std::string Summary() const {
+    return android::base::StringPrintf(
+        "vecs:%zu edges:%zu", graph_.vertex_count(), graph_.edge_count());
+  }
+
+  const auto& GetVertices() const { 
+    return graph_.get_vertices();
+  }
+
+  graaf::graph<GraphNode, GraphEdge, GraphType> graph_;
+};
+class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> {
+ public:
+  DependencyGraph() = default;
+  ~DependencyGraph() = default;
   void UpdateEdge(const DexSymId from_dex_sym_id,
                   const DexSymId to_dex_sym_id,
                   std::bitset<3> deps) {
@@ -132,18 +147,7 @@ class DependencyGraph {
       graph_.add_edge(from_vertex_id, to_vertex_id, DependencyGraphEdge(deps));
     }
   }
-
-  std::string Summary() const {
-    return android::base::StringPrintf(
-        "vecs:%zu edges:%zu", graph_.vertex_count(), graph_.edge_count());
-  }
-
-  const auto& GetVertices() const { 
-    return graph_.get_vertices();
-  }
-
  private:
-  graaf::graph<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> graph_;
   friend class DependencyGraphBuilder;
   friend class DependencyGraphPropagator;
 };
@@ -416,31 +420,8 @@ class InlineCallGraphEdge {
  private:
   // No additional data for now.
 };
-class InlineCallGraph {
+class InlineCallGraph: public GraphBase<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::UNDIRECTED> {
  public:
-  bool GetVertexIfExists(const std::string& descriptor, graaf::vertex_id_t* vertex_id) const {
-    auto it = descriptor_to_vertex_id_.find(descriptor);
-    if (it != descriptor_to_vertex_id_.end()) {
-      *vertex_id = it->second;
-      return true;
-    }
-    return false;
-  }
-  template <typename... Args>
-  std::enable_if_t<std::is_constructible_v<InlineCallGraphNode, Args&&...>, graaf::vertex_id_t>
-  GetOrAddVertexIfAbsent(Args&&... args) {
-    InlineCallGraphNode node(std::forward<Args>(args)...);
-    auto it = descriptor_to_vertex_id_.find(node.GetDescriptor());
-    if (it != descriptor_to_vertex_id_.end()) {
-      return it->second;
-    }
-    graaf::vertex_id_t vertex_id = graph_.add_vertex(node);
-    descriptor_to_vertex_id_[node.GetDescriptor()] = vertex_id;
-    return vertex_id;
-  }
- private:
-  graaf::graph<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::UNDIRECTED> graph_;
-  std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
   friend class InlineCallGraphBuilder;
 };
 class InlineCallGraphBuilder {
@@ -477,7 +458,8 @@ class InlineCallGraphBuilder {
           uint32_t dex_method_idx = method.GetIndex();
           std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
           std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
-          auto id = graph_.GetOrAddVertexIfAbsent(pretty_method, false);
+          DexSymId dex_sym_id(i, true, dex_method_idx);
+          graph_.AddVertexIfAbsent(dex_sym_id, pretty_method, false);
         }
       }
     }
@@ -510,13 +492,14 @@ class InlineCallGraphBuilder {
           uint32_t dex_method_idx = method.GetIndex();
           std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
           std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
-          AnalyzeOatMethod(method_header, pretty_method);
+          DexSymId caller_dex_sym_id(i, true, dex_method_idx);
+          AnalyzeOatMethod(method_header, caller_dex_sym_id);
         }
       }
     }
     return true;
   }
-  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const std::string& current_method_name) {
+  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id) {
     CodeInfo code_info(caller_header);
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
@@ -524,19 +507,15 @@ class InlineCallGraphBuilder {
           continue;
         }
         ArtMethod* callee = inline_info.GetArtMethod();
+        size_t dex_file_index = code_info.GetMethodInfoOf(inline_info).GetDexFileIndex(); // TODO: what if callee in bcp? And is the index right?
+        // TODO: If callee is from boot classpath, skip it for no problem.
+        inline_info.GetMethodInfoIndex();
         ScopedObjectAccess soa(Thread::Current());
         
-        graaf::vertex_id_t vertex_id_caller;
-        graaf::vertex_id_t vertex_id_callee;
-        if (!graph_.GetVertexIfExists(current_method_name, &vertex_id_caller)) {
-          LOG(ERROR) << "Caller method not found in graph: " << current_method_name;
-          return false;
-        }
-        if (!graph_.GetVertexIfExists(callee->PrettyMethod(), &vertex_id_callee)) {
-          LOG(ERROR) << "Callee method not found in graph: " << callee->PrettyMethod();
-          return false;
-        }
-        std::string callee_method_name = callee->PrettyMethod();
+        graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
+        DexSymId callee_dex_sym_id(dex_file_index, true, callee->GetDexMethodIndex());
+        graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
+        graph_.AddVertexIfAbsent(callee_dex_sym_id, callee->PrettyMethod(), false);
         graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
       }
     }

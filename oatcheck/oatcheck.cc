@@ -17,6 +17,8 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -55,6 +57,29 @@ enum class DependencyType {
   kVirtualTableLayout,
   kDependencyTypeCount
 };
+struct DexSymId {
+  uint32_t id;
+  // |-- 8 bits: dex file index --|-- 8 bits: is method --|-- 16 bits: sym id --|
+  void SetDexFileIndex(uint32_t dex_file_index) {
+    id = (id & 0x00FFFFFF) | (dex_file_index << 24);
+  }
+  uint32_t GetDexFileIndex() {
+    return (id >> 24) & 0xFF;
+  }
+  bool IsMethod() const {
+    return (id & 0x00FF0000) != 0;
+  }
+  void SetSymId(uint32_t sym_id) {
+    id = (id & 0xFFFF0000) | (sym_id & 0x0000FFFF);
+  }
+  DexSymId(uint32_t dex_file_index, bool is_method, uint32_t sym_id) : id(0) {
+    SetDexFileIndex(dex_file_index);
+    if (is_method) {
+      id |= 0x00010000;
+    }
+    SetSymId(sym_id);
+  }
+};
 
 class DependencyGraphNode {
  public:
@@ -87,22 +112,19 @@ class DependencyGraph {
   ~DependencyGraph() = default;
   template <typename... Args>
   std::enable_if_t<std::is_constructible_v<DependencyGraphNode, Args&&...>, graaf::vertex_id_t>
-  GetOrAddVertexIfAbsent(Args&&... args) {
+  AddVertexIfAbsent(DexSymId dex_sym_id, Args&&... args) {
+    graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(dex_sym_id.id);
+    if (graph_.has_vertex(vertex_id))
+      return vertex_id;
     DependencyGraphNode node(std::forward<Args>(args)...);
-    auto it = descriptor_to_vertex_id_.find(node.GetDescriptor());
-    if (it != descriptor_to_vertex_id_.end()) {
-      return it->second;
-    }
-    graaf::vertex_id_t vertex_id = graph_.add_vertex(node);
-    descriptor_to_vertex_id_[node.GetDescriptor()] = vertex_id;
+    graph_.add_vertex(node, vertex_id);
     return vertex_id;
   }
-  void UpdateEdge(const std::string from_descriptor,
-                  const std::string to_descriptor,
+  void UpdateEdge(const DexSymId from_dex_sym_id,
+                  const DexSymId to_dex_sym_id,
                   std::bitset<3> deps) {
-    graaf::vertex_id_t from_vertex_id = GetOrAddVertexIfAbsent(from_descriptor);
-    graaf::vertex_id_t to_vertex_id = GetOrAddVertexIfAbsent(to_descriptor);
-
+    graaf::vertex_id_t from_vertex_id = static_cast<graaf::vertex_id_t>(from_dex_sym_id.id);
+    graaf::vertex_id_t to_vertex_id = static_cast<graaf::vertex_id_t>(to_dex_sym_id.id);
     if (graph_.has_edge(from_vertex_id, to_vertex_id)) {
       auto& edge = graph_.get_edge(from_vertex_id, to_vertex_id);
       edge.SetDeps(edge.GetDeps() | deps);
@@ -122,7 +144,6 @@ class DependencyGraph {
 
  private:
   graaf::graph<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> graph_;
-  std::unordered_map<std::string, graaf::vertex_id_t> descriptor_to_vertex_id_;
   friend class DependencyGraphBuilder;
   friend class DependencyGraphPropagator;
 };
@@ -138,15 +159,17 @@ class DependencyGraphBuilder {
     if (!ExtractDexFromApk(error_msg)) {
       return false;
     }
+    size_t i = 0;
     for (const auto& dex : dex_files_) {
-      if (!AnalyzeDexMethods(dex.get(), error_msg)) {
+      if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
         LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
         return false;
       }
-      if (!AnalyzeDexClasses(dex.get(), error_msg)) {
+      if (!AnalyzeDexClasses(dex.get(), i, error_msg)) {
         LOG(ERROR) << "Failed to analyze DEX classes: " << *error_msg;
         return false;
       }
+      i++;
     }
     LOG(INFO) << graph_.Summary();
     return true;
@@ -178,25 +201,34 @@ class DependencyGraphBuilder {
     LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s):\n";
     return true;
   }
-  bool AnalyzeDexClasses(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
+  bool AnalyzeDexClasses(const art::DexFile* dex,size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
     // Build dependency edges based on class hierarchy.
     for (art::ClassAccessor accessor : dex->GetClasses()) {
       const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
       const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
       const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
       const char* class_descriptor = accessor.GetDescriptor();
-      graph_.UpdateEdge(superclass_descriptor, class_descriptor, std::bitset<3>(7));
+      DexSymId superclass_dex_sym_id(dex_file_idx, false,
+                                    class_def.superclass_idx_.index_);
+      DexSymId class_dex_sym_id(dex_file_idx, false,
+                                 accessor.GetClassIdx().index_);
+      graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
+      graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+      graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
     }
     return true;
   }
-  bool AnalyzeDexMethods(const art::DexFile* dex, ATTRIBUTE_UNUSED std::string* error_msg) {
+  bool AnalyzeDexMethods(const art::DexFile* dex,size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
     // Build dependency edges based on method instructions.
     uint32_t count = 0;
     for (art::ClassAccessor accessor : dex->GetClasses()) {
       for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
-        std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        if (count++ > 10000) // TODO: remove me
+        //std::string method_name(dex->PrettyMethod(method.GetIndex()));
+        std::string method_name(android::base::StringPrintf("d%zum%u", dex_file_idx,count));
+        DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex());
+        graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
+        if (count++ > 50000) // TODO: remove me
           return true;
         for (auto it = code.begin(); it != code.end(); it++) {
           DexInstructionPcPair inst = *it;
@@ -209,10 +241,12 @@ class DependencyGraphBuilder {
                 const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
                 const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
                 const char* class_descriptor = dex->GetStringData(name_id);
+                DexSymId class_dex_sym_id(dex_file_idx, false, method_id.class_idx_.index_);
+                graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
                 graph_.UpdateEdge(
-                    class_descriptor,
-                    method_name,
+                    class_dex_sym_id,
+                    method_dex_sym_id,
                     std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
                 break;
               }
@@ -236,10 +270,12 @@ class DependencyGraphBuilder {
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
+            DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
+            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
             graph_.UpdateEdge(
-                class_descriptor,
-                method_name,
+                class_dex_sym_id,
+                method_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
           } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
             auto field_idx = inst->VRegB();
@@ -247,10 +283,12 @@ class DependencyGraphBuilder {
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
+            DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
+            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
             graph_.UpdateEdge(
-                class_descriptor,
-                method_name,
+                class_dex_sym_id,
+                method_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
           }
         }

@@ -44,11 +44,13 @@
 #include "graaflib/graph.h"
 #include "graaflib/types.h"
 #include "oat/oat_file.h"
+#include "oat/oat_file-inl.h"
 #include "oat/oat_quick_method_header.h"
 #include "oat/stack_map.h"
 #include "runtime-inl.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 namespace art {
 enum class DependencyType {
   kStaticFieldLayout,

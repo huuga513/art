@@ -22,7 +22,6 @@
 #include <iostream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -135,6 +134,10 @@ class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge
  public:
   DependencyGraph() = default;
   ~DependencyGraph() = default;
+  DependencyGraph(DependencyGraph&&) = default;
+  DependencyGraph& operator=(DependencyGraph&&) = default;
+  DependencyGraph(const DependencyGraph&) = delete;
+  DependencyGraph& operator=(const DependencyGraph&) = delete;
   void UpdateEdge(const DexSymId from_dex_sym_id,
                   const DexSymId to_dex_sym_id,
                   std::bitset<3> deps) {
@@ -158,6 +161,9 @@ class DependencyGraphBuilder {
       : apk_file_path_(apk_file_path), graph_(*graph) {
     // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in
     // OAT.
+  }
+  const std::vector<std::unique_ptr<const art::DexFile>>& GetDexFiles() const {
+    return dex_files_;
   }
   bool BuildGraph(std::string* error_msg) {
     if (!ExtractDexFromApk(error_msg)) {
@@ -208,6 +214,7 @@ class DependencyGraphBuilder {
   bool AnalyzeDexClasses(const art::DexFile* dex,size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
     // Build dependency edges based on class hierarchy.
     for (art::ClassAccessor accessor : dex->GetClasses()) {
+      // TODO: Handle interfaces
       const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
       const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
       const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
@@ -349,6 +356,9 @@ class OatFileAnalyzer {
     }
     return true;
   }
+  const art::OatFile* GetOatFile() const {
+    return oat_file_.get();
+  }
   // Returns a list of human-readable method descriptors for all methods
   // in the OAT file that have compiled native code (i.e., non-null CompiledMethod).
   // Format example: "java.lang.Object.toString:()Ljava/lang/String;"
@@ -420,9 +430,144 @@ class InlineCallGraphEdge {
  private:
   // No additional data for now.
 };
-class InlineCallGraph: public GraphBase<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::UNDIRECTED> {
+class InlineCallGraph: public GraphBase<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::DIRECTED> {
  public:
   friend class InlineCallGraphBuilder;
+  friend class InlineDependencyExpander;
+};
+
+// InlineDependencyExpander propagates dependencies through the inline call graph.
+// For each inline edge B → A (method B is inlined into method A), and for each
+// dependency edge A → C in the dependency graph, this class creates a new graph
+// that adds the edge B → C.
+class InlineDependencyExpander {
+ public:
+  InlineDependencyExpander(const DependencyGraph* original_dep_graph, const InlineCallGraph* inline_graph)
+      : original_dep_graph_(*original_dep_graph), inline_graph_(*inline_graph) {}
+
+  // Expand dependencies using 1-hop propagation through inline call graph.
+  // Creates a new graph with original edges plus expanded edges.
+  // Returns the number of new edges added.
+  size_t ExpandDependencies(DependencyGraph* expanded_graph) {
+    size_t new_edges_added = 0;
+
+    // Step 1: Copy original graph to the new graph
+    CopyOriginalGraph(expanded_graph);
+
+    // Step 2: For each inline edge B → A (B is inlined into A)
+    for (const auto& [vertex_a_id, vertex_a] : inline_graph_.GetVertices()) {
+      // Get all predecessors B of A (B → A means B is inlined into A)
+      std::vector<graaf::vertex_id_t> predecessors = GetPredecessors(inline_graph_.graph_, vertex_a_id);
+
+      if (predecessors.empty()) {
+        continue;
+      }
+
+      // Skip if vertex A doesn't exist in original dependency graph
+      if (!original_dep_graph_.graph_.has_vertex(vertex_a_id)) {
+        continue;
+      }
+
+      // Get all outgoing edges from A in original dependency graph (A → C)
+      // Read directly from original graph, no need for separate storage
+      auto neighbors_a = original_dep_graph_.graph_.get_neighbors(vertex_a_id);
+
+      if (neighbors_a.empty()) {
+        continue;
+      }
+
+      // For each B that is inlined into A
+      for (graaf::vertex_id_t vertex_b_id : predecessors) {
+        // Skip if vertex B doesn't exist in original dependency graph
+        if (!original_dep_graph_.graph_.has_vertex(vertex_b_id)) {
+          continue;
+        }
+
+        // For each dependency edge A → C, add B → C to expanded graph
+        for (graaf::vertex_id_t vertex_c_id : neighbors_a) {
+          // Get the dependency bits from original graph
+          const auto& edge_ac = original_dep_graph_.graph_.get_edge(vertex_a_id, vertex_c_id);
+          std::bitset<3> deps = edge_ac.GetDeps();
+
+          // Create DexSymId from vertex IDs
+          DexSymId from_dex_sym_id = VertexIdToDexSymId(vertex_b_id);
+          DexSymId to_dex_sym_id = VertexIdToDexSymId(vertex_c_id);
+
+          // Add or update the edge in expanded graph
+          if (!expanded_graph->graph_.has_edge(vertex_b_id, vertex_c_id)) {
+            expanded_graph->UpdateEdge(from_dex_sym_id, to_dex_sym_id, deps);
+            new_edges_added++;
+          } else {
+            // Check if we need to merge dependency bits
+            auto& existing_edge = expanded_graph->graph_.get_edge(vertex_b_id, vertex_c_id);
+            std::bitset<3> new_deps = existing_edge.GetDeps() | deps;
+            if (new_deps != existing_edge.GetDeps()) {
+              expanded_graph->UpdateEdge(from_dex_sym_id, to_dex_sym_id, new_deps);
+              new_edges_added++;
+            }
+          }
+        }
+      }
+    }
+
+    LOG(INFO) << "Inline dependency expansion complete: added " << new_edges_added << " new edges";
+    return new_edges_added;
+  }
+
+ private:
+  // Copy all vertices and edges from original graph to the new graph
+  void CopyOriginalGraph(DependencyGraph* expanded_graph) {
+    // First, copy all vertices
+    for (const auto& [vertex_id, vertex] : original_dep_graph_.GetVertices()) {
+      // Add vertex using the same ID (DexSymId.id)
+      DexSymId dex_sym_id = VertexIdToDexSymId(vertex_id);
+      expanded_graph->AddVertexIfAbsent(dex_sym_id, vertex.GetDescriptor(), vertex.IsChanged());
+    }
+
+    // Then, copy all edges
+    for (const auto& [vertex_id, _] : original_dep_graph_.GetVertices()) {
+      auto neighbors = original_dep_graph_.graph_.get_neighbors(vertex_id);
+      for (graaf::vertex_id_t neighbor_id : neighbors) {
+        const auto& edge = original_dep_graph_.graph_.get_edge(vertex_id, neighbor_id);
+        DexSymId from_dex_sym_id = VertexIdToDexSymId(vertex_id);
+        DexSymId to_dex_sym_id = VertexIdToDexSymId(neighbor_id);
+        expanded_graph->UpdateEdge(from_dex_sym_id, to_dex_sym_id, edge.GetDeps());
+      }
+    }
+  }
+
+  // Get all predecessors of a vertex in a directed graph
+  static std::vector<graaf::vertex_id_t> GetPredecessors(
+      const graaf::graph<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::DIRECTED>& graph,
+      graaf::vertex_id_t vertex_id) {
+    std::vector<graaf::vertex_id_t> predecessors;
+
+    // Iterate all vertices to find those pointing to vertex_id
+    for (const auto& [other_id, _] : graph.get_vertices()) {
+      if (other_id == vertex_id) {
+        continue;
+      }
+      auto neighbors = graph.get_neighbors(other_id);
+      if (std::find(neighbors.begin(), neighbors.end(), vertex_id) != neighbors.end()) {
+        predecessors.push_back(other_id);
+      }
+    }
+
+    return predecessors;
+  }
+
+  // Convert vertex ID to DexSymId. Vertex ID is directly the DexSymId.id value.
+  static DexSymId VertexIdToDexSymId(graaf::vertex_id_t vertex_id) {
+    // We're just creating a DexSymId object that has the given id. The other
+    // parameters are ignored since we only use the id field in graph operations.
+    DexSymId result(0, false, 0);
+    // Set the raw id value directly
+    result.id = static_cast<uint32_t>(vertex_id);
+    return result;
+  }
+
+  const DependencyGraph& original_dep_graph_;
+  const InlineCallGraph& inline_graph_;
 };
 class InlineCallGraphBuilder {
  public:
@@ -516,7 +661,8 @@ class InlineCallGraphBuilder {
         DexSymId callee_dex_sym_id(dex_file_index, true, callee->GetDexMethodIndex());
         graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
         graph_.AddVertexIfAbsent(callee_dex_sym_id, callee->PrettyMethod(), false);
-        graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
+        // If method B is inlined into method A, create edge B → A to indicate that changes to B affect A
+        graph_.graph_.add_edge(vertex_id_callee, vertex_id_caller, InlineCallGraphEdge());
       }
     }
     return true;
@@ -648,6 +794,35 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
+    }
+
+    // Build inline call graph if OAT file is provided
+    InlineCallGraph inline_call_graph;
+    if (args_->oat_file_) {
+      LOG(INFO) << "Building inline call graph from OAT file...";
+      OatFileAnalyzer oat_analyzer(args_->oat_file_);
+      if (!oat_analyzer.LoadOatFile(&error_msg)) {
+        LOG(ERROR) << "Failed to load OAT file: " << error_msg;
+        return false;
+      }
+      InlineCallGraphBuilder inline_graph_builder(&inline_call_graph,
+                                                 oat_analyzer.GetOatFile(),
+                                                 graph_builder.GetDexFiles());
+      if (!inline_graph_builder.BuildGraph(&error_msg)) {
+        LOG(ERROR) << "Failed to build inline call graph: " << error_msg;
+        return false;
+      }
+      LOG(INFO) << "Inline call graph built: "
+                << inline_call_graph.graph_.vertex_count() << " vertices, "
+                << inline_call_graph.graph_.edge_count() << " edges";
+
+      // Expand dependencies through inline call graph
+      LOG(INFO) << "Expanding dependencies through inline call graph...";
+      InlineDependencyExpander expander(&graph, &inline_call_graph);
+      DependencyGraph expanded_graph;
+      size_t new_edges = expander.ExpandDependencies(&expanded_graph);
+      graph = std::move(expanded_graph);
+      LOG(INFO) << "Dependency graph after expansion: " << graph.Summary();
     }
 
     std::ostream* os = &std::cout;

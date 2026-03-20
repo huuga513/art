@@ -65,4 +65,4 @@ def run_host(app: str, asop_root: str, mode, *args):
 if __name__ == "__main__":
     import sys
    # run_host("oatcheck", config["AOSP_ROOT"],"perf", *sys.argv[1:])
-    run_host("out/host/linux-x86/bin/oatcheck", config["AOSP_ROOT"],"perf", *sys.argv[1:])
+    run_host("out/host/linux-x86/bin/oatcheck", config["AOSP_ROOT"],"", *sys.argv[1:])

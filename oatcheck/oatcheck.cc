@@ -80,6 +80,9 @@ struct DexSymId {
     }
     SetSymId(sym_id);
   }
+  // Construct DexSymId from graaf vertex_id_t. Since vertex_id_t is directly
+  // mapped to DexSymId.id, we can directly assign it.
+  explicit DexSymId(graaf::vertex_id_t vertex_id) : id(static_cast<uint32_t>(vertex_id)) {}
 };
 
 class DependencyGraphNode {
@@ -497,8 +500,8 @@ class InlineDependencyExpander {
           std::bitset<3> deps = edge_bc.GetDeps();
 
           // Create DexSymId from vertex IDs
-          DexSymId from_dex_sym_id = VertexIdToDexSymId(vertex_a_id);
-          DexSymId to_dex_sym_id = VertexIdToDexSymId(vertex_c_id);
+          DexSymId from_dex_sym_id(vertex_a_id);
+          DexSymId to_dex_sym_id(vertex_c_id);
 
           // Add or update the edge in expanded graph
           if (!expanded_graph->graph_.has_edge(vertex_a_id, vertex_c_id)) {
@@ -539,16 +542,6 @@ class InlineDependencyExpander {
     }
 
     return predecessors;
-  }
-
-  // Convert vertex ID to DexSymId. Vertex ID is directly the DexSymId.id value.
-  static DexSymId VertexIdToDexSymId(graaf::vertex_id_t vertex_id) {
-    // We're just creating a DexSymId object that has the given id. The other
-    // parameters are ignored since we only use the id field in graph operations.
-    DexSymId result(0, false, 0);
-    // Set the raw id value directly
-    result.id = static_cast<uint32_t>(vertex_id);
-    return result;
   }
 
   const DependencyGraph& original_dep_graph_;

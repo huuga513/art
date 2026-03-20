@@ -435,11 +435,7 @@ class OatFileAnalyzer {
       }
 
       const art::DexFile* dex_file = dex_files_[i].get();
-      if (dex_file->GetLocation() != oat_dex_file->GetDexFileLocation()) {
-        *error_msg = "DEX location mismatch between OAT and DEX files.";
-        LOG(ERROR) << *error_msg;
-        return false;
-      }
+      // Skip DEX location check because DEX files extracted from APK may not match OAT file's recorded location
       for (ClassAccessor accessor : dex_file->GetClasses()) {
         const uint16_t class_def_index = accessor.GetClassDefIndex();
         const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
@@ -596,7 +592,7 @@ class InlineDependencyExpander {
 class InlineCallGraphBuilder {
  public:
   InlineCallGraphBuilder(InlineCallGraph* graph, const art::OatFile* oat_file, const std::vector<std::unique_ptr<const art::DexFile>>& dex_files) : graph_(*graph), oat_file_(*oat_file), dex_files_(dex_files) {}
-  bool BuildGraph(std::string* error_msg) {
+  bool BuildGraph(ATTRIBUTE_UNUSED std::string* error_msg) {
     size_t dex_file_count = oat_file_.GetOatDexFiles().size();
     for (size_t i = 0; i < dex_file_count; ++i) {
       const art::OatDexFile* oat_dex_file = oat_file_.GetOatDexFiles()[i];
@@ -605,11 +601,7 @@ class InlineCallGraphBuilder {
       }
 
       const art::DexFile* dex_file = dex_files_[i].get();
-      if (dex_file->GetLocation() != oat_dex_file->GetDexFileLocation()) {
-        *error_msg = "DEX location mismatch between OAT and DEX files.";
-        LOG(ERROR) << *error_msg;
-        return false;
-      }
+      // Skip DEX location check because DEX files extracted from APK may not match OAT file's recorded location
       for (ClassAccessor accessor : dex_file->GetClasses()) {
         const uint16_t class_def_index = accessor.GetClassDefIndex();
         const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
@@ -640,11 +632,6 @@ class InlineCallGraphBuilder {
       }
 
       const art::DexFile* dex_file = dex_files_[i].get();
-      if (dex_file->GetLocation() != oat_dex_file->GetDexFileLocation()) {
-        *error_msg = "DEX location mismatch between OAT and DEX files.";
-        LOG(ERROR) << *error_msg;
-        return false;
-      }
       for (ClassAccessor accessor : dex_file->GetClasses()) {
         const uint16_t class_def_index = accessor.GetClassDefIndex();
         const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);

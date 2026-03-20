@@ -52,3 +52,13 @@ To compile oatcheck, use:
 ```bash
 cd /ssd2/wyz/AOSP && source ./setenv-lynx.sh && m oatcheck
 ```
+
+## Testing oatcheck
+
+To test oatcheck, just pick an app in /ssd2/wyz/app_oats. Each directory represents an app, base.apk is the app apk, and odex files are located in oat subdir
+
+Use oatcheck/oatcheck_host.py to run oatcheck:
+```bash
+oatcheck/oatcheck_host.py [args of oatcheck]
+```
+

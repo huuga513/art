@@ -659,21 +659,31 @@ class InlineCallGraphBuilder {
     CodeInfo code_info(caller_header);
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
-        if (!inline_info.EncodesArtMethod()) {
-          continue;
+        MethodInfo method_info = code_info.GetMethodInfoOf(inline_info);
+
+        // Prefer MethodInfo regardless of whether ArtMethod* is available or not
+        if (method_info.HasDexFileIndex()) {
+          graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
+          DexSymId callee_dex_sym_id(method_info.GetDexFileIndex(), true, method_info.GetMethodIndex());
+          graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
+
+          // Try to get method name
+          std::string method_name;
+          if (inline_info.EncodesArtMethod()) {
+            ArtMethod* callee = inline_info.GetArtMethod();
+            ScopedObjectAccess soa(Thread::Current());
+            method_name = callee->PrettyMethod();
+          } else {
+            // No ArtMethod*, use index as method name
+            method_name = android::base::StringPrintf("d%uu%u", method_info.GetDexFileIndex(), method_info.GetMethodIndex());
+          }
+
+          graph_.AddVertexIfAbsent(callee_dex_sym_id, method_name, false);
+          // If method A inlines method B, create edge A → B to indicate that A inlines B
+          if (!graph_.graph_.has_edge(vertex_id_caller, vertex_id_callee)) {
+            graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
+          }
         }
-        ArtMethod* callee = inline_info.GetArtMethod();
-        size_t dex_file_index = code_info.GetMethodInfoOf(inline_info).GetDexFileIndex(); // TODO: what if callee in bcp? And is the index right?
-        // TODO: If callee is from boot classpath, skip it for no problem.
-        inline_info.GetMethodInfoIndex();
-        ScopedObjectAccess soa(Thread::Current());
-        
-        graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
-        DexSymId callee_dex_sym_id(dex_file_index, true, callee->GetDexMethodIndex());
-        graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
-        graph_.AddVertexIfAbsent(callee_dex_sym_id, callee->PrettyMethod(), false);
-        // If method B is inlined into method A, create edge A → B to indicate that A inlines B
-        graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
       }
     }
     return true;

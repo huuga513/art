@@ -97,7 +97,41 @@ class DependencyGraphNode {
   std::string descriptor_;
   std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)> changes_;
   friend class DependencyGraphPropagator;
+  friend class DependencyGraphBuilder;
 };
+
+// Caches all boot classpath class descriptors for fast lookup
+static std::unordered_set<std::string> bcp_class_descriptors;
+
+// Initializes the bcp_class_descriptors cache from ClassLinker::GetBootClassPath()
+static void InitializeBootClassPathDescriptors() {
+  if (!bcp_class_descriptors.empty()) {
+    return;  // Already initialized
+  }
+
+  // Get all boot class path DexFiles
+  const auto& bcp_dex_files = Runtime::Current()->GetClassLinker()->GetBootClassPath();
+
+  // Collect all class descriptors from all boot class path DexFiles
+  for (const DexFile* dex_file : bcp_dex_files) {
+    uint32_t num_class_defs = dex_file->NumClassDefs();
+    for (uint32_t i = 0; i < num_class_defs; ++i) {
+      const dex::ClassDef& class_def = dex_file->GetClassDef(i);
+      const char* class_descriptor = dex_file->GetClassDescriptor(class_def);
+      bcp_class_descriptors.insert(class_descriptor);
+    }
+  }
+}
+
+// Returns true if the class descriptor represents a boot classpath class.
+// Uses the cached boot classpath class descriptors.
+bool IsBootClasspathClass(std::string_view class_descriptor) {
+  // Initialize cache if not already done
+  InitializeBootClassPathDescriptors();
+
+  // Lookup in the cached boot classpath class descriptors
+  return bcp_class_descriptors.find(std::string(class_descriptor)) != bcp_class_descriptors.end();
+}
 
 class DependencyGraphEdge {
  public:
@@ -276,8 +310,20 @@ class DependencyGraphBuilder {
               case kDexInvokeSuper:
               case kDexInvokeDirect:
               case kDexInvokeStatic: {
-                // TODO: If invoke target is from boot classpath, just set the method vertex as
-                // changed.
+                // For invoke-super, invoke-direct, and invoke-static, if the target is
+                // from boot classpath, the call will always invalidate on system upgrade.
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* class_descriptor = dex->GetStringData(name_id);
+
+                if (IsBootClasspathClass(class_descriptor)) {
+                  // Mark the calling method as changed - all dependency bits set
+                  graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+                  auto& vertex = graph_.graph_.get_vertex(vertex_id);
+                  vertex.changes_.set();
+                }
                 break;
               }
               case kDexInvokeInterface:

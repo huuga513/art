@@ -271,7 +271,8 @@ class DependencyGraphBuilder {
                                  accessor.GetClassIdx().index_);
       graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
       graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-      graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
+      // Edge from subclass to superclass: subclass depends on superclass
+      graph_.UpdateEdge(class_dex_sym_id, superclass_dex_sym_id, std::bitset<3>(7));
     }
     return true;
   }
@@ -301,9 +302,10 @@ class DependencyGraphBuilder {
                 DexSymId class_dex_sym_id(dex_file_idx, false, method_id.class_idx_.index_);
                 graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
+                // Edge from method to class: method depends on class (for virtual table layout)
                 graph_.UpdateEdge(
-                    class_dex_sym_id,
                     method_dex_sym_id,
+                    class_dex_sym_id,
                     std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
                 break;
               }
@@ -342,9 +344,10 @@ class DependencyGraphBuilder {
             DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
             graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
+            // Edge from method to class: method depends on class (for instance field layout)
             graph_.UpdateEdge(
-                class_dex_sym_id,
                 method_dex_sym_id,
+                class_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
           } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
             auto field_idx = inst->VRegB();
@@ -355,9 +358,10 @@ class DependencyGraphBuilder {
             DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
             graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
+            // Edge from method to class: method depends on class (for static field layout)
             graph_.UpdateEdge(
-                class_dex_sym_id,
                 method_dex_sym_id,
+                class_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
           }
         }
@@ -375,8 +379,29 @@ class DependencyGraphPropagator {
  public:
   DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
   void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
+  // Get all predecessors of a vertex (nodes that have edges pointing to this vertex)
+  std::vector<graaf::vertex_id_t> GetPredecessors(graaf::vertex_id_t vertex_id) {
+    std::vector<graaf::vertex_id_t> predecessors;
+    auto& inner_graph = graph_.graph_;
+
+    // Iterate all vertices to find those pointing to vertex_id
+    for (const auto& [other_id, _] : inner_graph.get_vertices()) {
+      if (other_id == vertex_id) {
+        continue;
+      }
+      auto neighbors = inner_graph.get_neighbors(other_id);
+      if (std::find(neighbors.begin(), neighbors.end(), vertex_id) != neighbors.end()) {
+        predecessors.push_back(other_id);
+      }
+    }
+
+    return predecessors;
+  }
+
   void PropagateChanges() {
-    // Propagate changes from the initial changed classes through the dependency graph.
+    // Propagate changes through the dependency graph.
+    // Edge X → Y means X depends on Y, so if Y changes, X is also affected.
+    // We propagate changes in reverse topological order.
     auto& inner_graph = graph_.graph_;
     auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(
         graph_.graph_);
@@ -385,11 +410,19 @@ class DependencyGraphPropagator {
       return;
     }
     const std::vector<graaf::vertex_id_t>& topo = result.value();
-    for (auto id : topo) {
-      for (auto succId : inner_graph.get_neighbors(id)) {
-        auto edge = inner_graph.get_edge(id, succId);
-        auto& succ = inner_graph.get_vertex(succId);
-        succ.changes_ |= edge.GetDeps() & inner_graph.get_vertex(id).changes_;
+
+    // Iterate in reverse topological order
+    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+      graaf::vertex_id_t id = *it;
+      auto& vertex = inner_graph.get_vertex(id);
+
+      // For all predecessors (X where X → id, meaning X depends on id)
+      // If id has changes, X also gets those changes
+      auto predecessors = GetPredecessors(id);
+      for (graaf::vertex_id_t pred_id : predecessors) {
+        auto& pred_vertex = inner_graph.get_vertex(pred_id);
+        auto edge = inner_graph.get_edge(pred_id, id);
+        pred_vertex.changes_ |= edge.GetDeps() & vertex.changes_;
       }
     }
   }

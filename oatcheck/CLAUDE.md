@@ -46,6 +46,14 @@ Only documentation files specifically targeting non-English audiences may use ot
 
 Please ensure all contributions follow this guideline. Code reviews will check for compliance with this rule.
 
+## Git Repository Location
+
+The oatcheck project is part of the ART (Android Runtime) repository, located at:
+
+```
+/ssd2/wyz/AOSP/art/
+```
+
 ## Building oatcheck
 
 To compile oatcheck, use:

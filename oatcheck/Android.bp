@@ -26,6 +26,7 @@ cc_defaults {
     defaults: [ "art_defaults" ],
     host_supported: true,
     srcs: [
+        "dex_loader.cc",
         "oatcheck.cc",
     ],
     header_libs: [

@@ -69,4 +69,3 @@ Use oatcheck/oatcheck_host.py to run oatcheck:
 ```bash
 oatcheck/oatcheck_host.py [args of oatcheck]
 ```
-

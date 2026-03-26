@@ -154,7 +154,7 @@ class DexLoader {
   // Creates an isolated ClassLoader for the given DEX files.
   // This ClassLoader is not attached to any parent ClassLoader,
   // providing complete isolation.
-  Handle<mirror::ClassLoader> CreateIsolatedClassLoader(
+  jobject CreateIsolatedClassLoader(
       Thread* self,
       const std::vector<const DexFile*>& dex_files);
 

@@ -17,8 +17,10 @@
 #include "dex_loader.h"
 
 #include "android-base/logging.h"
+#include "class_loader_context.h"
 #include "dex/dex_file_loader.h"
 #include "dex/utf.h"
+#include "handle_scope.h"
 #include "interpreter/unstarted_runtime.h"
 #include "jni.h"
 #include "runtime.h"
@@ -26,6 +28,7 @@
 #include "handle_scope-inl.h"
 #include "mirror/class_loader.h"
 #include "scoped_thread_state_change-inl.h"
+#include "stack_reference.h"
 #include "thread.h"
 #include "well_known_classes.h"
 
@@ -58,8 +61,8 @@ void LoadedDex::RegisterLoadedClass(ObjPtr<mirror::Class> klass)
 DexLoader::DexLoader(Runtime* runtime)
     : runtime_(runtime),
       class_linker_(runtime->GetClassLinker()) {
-  DCHECK(runtime_ != nullptr);
-  DCHECK(class_linker_ != nullptr);
+  CHECK(runtime_ != nullptr);
+  CHECK(class_linker_ != nullptr);
 }
 
 std::unique_ptr<LoadedDex> DexLoader::LoadDex(const char* dex_path,
@@ -94,11 +97,13 @@ std::unique_ptr<LoadedDex> DexLoader::LoadDex(const char* dex_path,
   }
 
   // Create isolated ClassLoader
-  Handle<mirror::ClassLoader> class_loader = CreateIsolatedClassLoader(self, dex_file_ptrs);
-  if (class_loader.Get() == nullptr) {
+  jobject class_loader_jobj = CreateIsolatedClassLoader(self, dex_file_ptrs);
+  if (class_loader_jobj == nullptr) {
     LOG(ERROR) << "Failed to create isolated ClassLoader for " << dex_path;
     return nullptr;
   }
+  StackHandleScope<1> hs(soa.Self());
+  Handle<mirror::ClassLoader> class_loader = hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader_jobj));
 
   return std::make_unique<LoadedDex>(name, std::move(dex_files), class_loader);
 }
@@ -132,6 +137,8 @@ bool DexLoader::LoadAllClasses(LoadedDex* loaded_dex) {
 
       if (klass == nullptr) {
         if (self->IsExceptionPending()) {
+          LOG(WARNING) << "Exception while defining class " << descriptor << ":";
+          self->GetException()->Dump();
           self->ClearException();
         }
         LOG(WARNING) << "Failed to define class: " << descriptor;
@@ -174,36 +181,26 @@ ObjPtr<mirror::Class> DexLoader::FindClass(LoadedDex* loaded_dex,
   return klass;
 }
 
-Handle<mirror::ClassLoader> DexLoader::CreateIsolatedClassLoader(
+jobject DexLoader::CreateIsolatedClassLoader(
     Thread* self,
     const std::vector<const DexFile*>& dex_files) {
   ScopedObjectAccess soa(self);
-  StackHandleScope<1> hs(self);
-
-  // Initialize WellKnownClasses before using them
+  // Need well-known-classes.
   WellKnownClasses::Init(self->GetJniEnv());
 
-  // Initialize UnstartedRuntime to support class initialization
+  // Need a class loader. Fake that we're a compiler.
+  // Note: this will run initializers through the unstarted runtime, so make sure it's
+  //       initialized.
   interpreter::UnstartedRuntime::Initialize();
-
-  // Use ClassLinker::CreatePathClassLoader which properly initializes PathClassLoader
-  // This returns a jobject (JNI global reference), we need to convert it to ObjPtr
-  jobject class_loader_jobj = class_linker_->CreatePathClassLoader(self, dex_files);
-  if (class_loader_jobj == nullptr) {
-    LOG(ERROR) << "Failed to create PathClassLoader";
-    return hs.NewHandle<mirror::ClassLoader>(nullptr);
-  }
-
-  // Convert jobject to ObjPtr<mirror::ClassLoader>
-  ObjPtr<mirror::ClassLoader> class_loader =
-      soa.Decode<mirror::ClassLoader>(class_loader_jobj);
-
-  // Register dex files with the class loader
+  ClassLinker* class_linker = runtime_->GetClassLinker();
+  jobject class_loader = class_linker->CreatePathClassLoader(self, dex_files);
+  // Need to register dex files to get a working dex cache.
   for (const DexFile* dex_file : dex_files) {
-    class_linker_->RegisterDexFile(*dex_file, class_loader);
+    ObjPtr<mirror::DexCache> dex_cache = class_linker->RegisterDexFile(
+        *dex_file, self->DecodeJObject(class_loader)->AsClassLoader());
+    CHECK(dex_cache != nullptr);
   }
-
-  return hs.NewHandle(class_loader);
+  return class_loader;
 }
 
 }  // namespace art

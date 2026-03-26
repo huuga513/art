@@ -69,3 +69,13 @@ Use oatcheck/oatcheck_host.py to run oatcheck:
 ```bash
 oatcheck/oatcheck_host.py [args of oatcheck]
 ```
+
+## Testing dex_loader module
+The implement of dex_loader is dex_loader.cc.
+
+To test dex_loader module, just use the dex file /ssd2/wyz/classes.dex.
+
+Use oatcheck/test_dex_loader_host.py to run the test in text_dex_loader.cc:
+```bash
+oatcheck/test_dex_loader_host.py --dex=[dex file]
+```

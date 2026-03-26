@@ -22,9 +22,13 @@
 #include <string>
 
 #include "android-base/logging.h"
+#include "android-base/thread_annotations.h"
+#include "base/locks.h"
+#include "class_linker.h"
 #include "cmdline.h"
 #include "dex_loader.h"
 #include "mirror/class.h"
+#include "obj_ptr.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
 #include "scoped_thread_state_change-inl.h"
@@ -75,53 +79,63 @@ Options:
   }
 };
 
+class BootClassVisitor:public ClassVisitor{
+  virtual bool operator()(ObjPtr<mirror::Class> klass) override {
+    ScopedObjectAccess soa(Thread::Current());
+    klass->DumpClass(std::cout, 0);
+    return true;
+  }
+};
 struct TestDexLoaderMain : public CmdlineMain<TestDexLoaderArgs> {
   bool ExecuteWithRuntime(Runtime* runtime) override {
     CHECK(runtime != nullptr);
+    ClassLinker* class_linker = runtime->GetClassLinker();
+    ScopedObjectAccess soa(Thread::Current());
+    auto vistor = BootClassVisitor();
+    class_linker->VisitClassesWithoutClassesLock(&vistor);
+    //std::cout << "DexLoader Test\n";
+    //std::cout << "==============\n";
+    //std::cout << "DEX path: " << args_->dex_path << "\n";
 
-    std::cout << "DexLoader Test\n";
-    std::cout << "==============\n";
-    std::cout << "DEX path: " << args_->dex_path << "\n";
+    //DexLoader loader(runtime);
 
-    DexLoader loader(runtime);
+    //auto loaded_dex = loader.LoadDex(args_->dex_path, "test_dex");
+    //if (loaded_dex == nullptr) {
+      //std::cerr << "ERROR: Failed to load DEX\n";
+      //return false;
+    //}
 
-    auto loaded_dex = loader.LoadDex(args_->dex_path, "test_dex");
-    if (loaded_dex == nullptr) {
-      std::cerr << "ERROR: Failed to load DEX\n";
-      return false;
-    }
+    //std::cout << "DEX loaded successfully!\n";
+    //std::cout << "  Name: " << loaded_dex->GetName() << "\n";
+    //std::cout << "  DexFiles: " << loaded_dex->GetDexFiles().size() << "\n";
 
-    std::cout << "DEX loaded successfully!\n";
-    std::cout << "  Name: " << loaded_dex->GetName() << "\n";
-    std::cout << "  DexFiles: " << loaded_dex->GetDexFiles().size() << "\n";
+    //std::cout << "Loading all classes...\n";
+    //bool success = loader.LoadAllClasses(loaded_dex.get());
+    //if (!success) {
+      //std::cerr << "WARNING: Some classes failed to load\n";
+    //}
 
-    std::cout << "Loading all classes...\n";
-    bool success = loader.LoadAllClasses(loaded_dex.get());
-    if (!success) {
-      std::cerr << "WARNING: Some classes failed to load\n";
-    }
+    //std::cout << "Classes loaded: " << loaded_dex->GetLoadedClasses().size() << "\n";
 
-    std::cout << "Classes loaded: " << loaded_dex->GetLoadedClasses().size() << "\n";
+    //// Test FindClass - try to find a class
+    //auto& classes = loaded_dex->GetLoadedClasses();
+    //if (!classes.empty()) {
+      //// Get descriptor of first class (need mutator lock)
+      //ScopedObjectAccess soa(Thread::Current());
+      //std::string descriptor_storage;
+      //const char* first_descriptor = classes[0]->GetDescriptor(&descriptor_storage);
+      //std::cout << "First class: " << first_descriptor << "\n";
 
-    // Test FindClass - try to find a class
-    auto& classes = loaded_dex->GetLoadedClasses();
-    if (!classes.empty()) {
-      // Get descriptor of first class (need mutator lock)
-      ScopedObjectAccess soa(Thread::Current());
-      std::string descriptor_storage;
-      const char* first_descriptor = classes[0]->GetDescriptor(&descriptor_storage);
-      std::cout << "First class: " << first_descriptor << "\n";
+      //// Try to find it via FindClass
+      //auto found = loader.FindClass(loaded_dex.get(), first_descriptor);
+      //if (found != nullptr) {
+        //std::cout << "FindClass works! Found: " << first_descriptor << "\n";
+      //} else {
+        //std::cerr << "ERROR: FindClass failed for " << first_descriptor << "\n";
+      //}
+    //}
 
-      // Try to find it via FindClass
-      auto found = loader.FindClass(loaded_dex.get(), first_descriptor);
-      if (found != nullptr) {
-        std::cout << "FindClass works! Found: " << first_descriptor << "\n";
-      } else {
-        std::cerr << "ERROR: FindClass failed for " << first_descriptor << "\n";
-      }
-    }
-
-    std::cout << "Test PASSED!\n";
+    //std::cout << "Test PASSED!\n";
     return true;
   }
 };

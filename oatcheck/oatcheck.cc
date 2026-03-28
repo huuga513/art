@@ -444,7 +444,8 @@ class DependencyGraphBuilder {
 class DependencyGraphPropagator {
  public:
   DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
-  void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
+  virtual ~DependencyGraphPropagator() = default;
+  virtual void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
   // Get all predecessors of a vertex (nodes that have edges pointing to this vertex)
   std::vector<graaf::vertex_id_t> GetPredecessors(graaf::vertex_id_t vertex_id) {
     std::vector<graaf::vertex_id_t> predecessors;
@@ -495,6 +496,86 @@ class DependencyGraphPropagator {
 
  private:
   DependencyGraph& graph_;
+};
+
+// BcpDependencyGraphPropagator compares new DexFiles against the BCP class descriptors
+// to determine which classes have changed.
+class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
+ public:
+  BcpDependencyGraphPropagator(
+      BcpDependencyGraph* bcp_graph,
+      const std::vector<std::unique_ptr<const art::DexFile>>& updated_boot_dex_files)
+      : DependencyGraphPropagator(bcp_graph),
+        bcp_graph_(*bcp_graph),
+        updated_boot_dex_files_(updated_boot_dex_files) {}
+
+  void SetInitialChanges() override {
+    // Iterate through all class nodes in BcpDependencyGraph
+    for (const auto& [vertex_id, vertex] : bcp_graph_.GetVertices()) {
+      // Create DexSymId from vertex_id
+      DexSymId dex_sym_id(vertex_id);
+
+      // Skip method nodes, only process class nodes
+      if (dex_sym_id.IsMethod()) {
+        continue;
+      }
+
+      const std::string& descriptor = vertex.GetDescriptor();
+
+      // Try to find the same class in new DexFiles
+      const art::DexFile* found_dex = nullptr;
+      uint32_t found_class_def_idx = 0;
+      if (FindClassInNewDexFiles(descriptor, &found_dex, &found_class_def_idx)) {
+        // Compare the class between old (from bcp_graph) and new (from new_dex_files)
+        // Create ClassAccessor for old class from bcp_graph
+        art::ClassAccessor old_class_accessor = bcp_graph_.GetClassAccessor(dex_sym_id);
+        // Create ClassAccessor for new class from updated_boot_dex_files
+        art::ClassAccessor new_class_accessor(*found_dex, found_class_def_idx);
+        CompareAndMarkChanges(dex_sym_id, old_class_accessor, new_class_accessor);
+      } else {
+        // Class not found in new DexFiles - mark as changed
+        // TODO: This might need special handling
+      }
+    }
+  }
+
+ private:
+  // Find a class by descriptor in new DexFiles
+  bool FindClassInNewDexFiles(const std::string& descriptor,
+                              const art::DexFile** out_dex,
+                              uint32_t* out_class_def_idx) const {
+    for (size_t i = 0; i < updated_boot_dex_files_.size(); ++i) {
+      const art::DexFile* dex = updated_boot_dex_files_[i].get();
+      for (uint32_t j = 0; j < dex->NumClassDefs(); ++j) {
+        const dex::ClassDef& class_def = dex->GetClassDef(j);
+        const char* class_descriptor = dex->GetClassDescriptor(class_def);
+        if (descriptor == class_descriptor) {
+          *out_dex = dex;
+          *out_class_def_idx = j;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Compare old and new class definitions using ClassAccessor and mark changes
+  void CompareAndMarkChanges(ATTRIBUTE_UNUSED const DexSymId& old_dex_sym_id,
+                             ATTRIBUTE_UNUSED const art::ClassAccessor& old_class_accessor,
+                             ATTRIBUTE_UNUSED const art::ClassAccessor& new_class_accessor) {
+    // TODO: Implement comparison logic using ClassAccessor
+    // - Compare static field layout
+    // - Compare instance field layout
+    // - Compare virtual table layout
+    // Then set the appropriate bits in the changes_ bitset
+    //
+    // For now, this is a placeholder that sets all change bits as an example:
+    // auto& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
+    // vertex.changes_.set();  // Mark as changed with all dependency types
+  }
+
+  BcpDependencyGraph& bcp_graph_;
+  const std::vector<std::unique_ptr<const art::DexFile>>& updated_boot_dex_files_;
 };
 
 class OatFileAnalyzer {

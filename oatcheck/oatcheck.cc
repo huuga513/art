@@ -507,7 +507,17 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       const std::vector<std::unique_ptr<const art::DexFile>>& updated_boot_dex_files)
       : DependencyGraphPropagator(bcp_graph),
         bcp_graph_(*bcp_graph),
-        updated_boot_dex_files_(updated_boot_dex_files) {}
+        updated_boot_dex_files_(updated_boot_dex_files) {
+    // Preprocess: build O(1) lookup map from descriptor to (DexFile*, class_def_idx)
+    for (size_t i = 0; i < updated_boot_dex_files_.size(); ++i) {
+      const art::DexFile* dex = updated_boot_dex_files_[i].get();
+      for (uint32_t j = 0; j < dex->NumClassDefs(); ++j) {
+        const dex::ClassDef& class_def = dex->GetClassDef(j);
+        const char* class_descriptor = dex->GetClassDescriptor(class_def);
+        class_lookup_[class_descriptor] = {dex, j};
+      }
+    }
+  }
 
   void SetInitialChanges() override {
     // Iterate through all class nodes in BcpDependencyGraph
@@ -522,7 +532,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
       const std::string& descriptor = vertex.GetDescriptor();
 
-      // Try to find the same class in new DexFiles
+      // O(1) lookup using preprocessed map
       const art::DexFile* found_dex = nullptr;
       uint32_t found_class_def_idx = 0;
       if (FindClassInNewDexFiles(descriptor, &found_dex, &found_class_def_idx)) {
@@ -540,21 +550,15 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   }
 
  private:
-  // Find a class by descriptor in new DexFiles
+  // Find a class by descriptor using preprocessed lookup table (O(1))
   bool FindClassInNewDexFiles(const std::string& descriptor,
                               const art::DexFile** out_dex,
                               uint32_t* out_class_def_idx) const {
-    for (size_t i = 0; i < updated_boot_dex_files_.size(); ++i) {
-      const art::DexFile* dex = updated_boot_dex_files_[i].get();
-      for (uint32_t j = 0; j < dex->NumClassDefs(); ++j) {
-        const dex::ClassDef& class_def = dex->GetClassDef(j);
-        const char* class_descriptor = dex->GetClassDescriptor(class_def);
-        if (descriptor == class_descriptor) {
-          *out_dex = dex;
-          *out_class_def_idx = j;
-          return true;
-        }
-      }
+    auto it = class_lookup_.find(descriptor);
+    if (it != class_lookup_.end()) {
+      *out_dex = it->second.first;
+      *out_class_def_idx = it->second.second;
+      return true;
     }
     return false;
   }
@@ -576,6 +580,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
   BcpDependencyGraph& bcp_graph_;
   const std::vector<std::unique_ptr<const art::DexFile>>& updated_boot_dex_files_;
+
+  // Preprocessed lookup: descriptor -> (DexFile*, class_def_idx)
+  std::unordered_map<std::string, std::pair<const art::DexFile*, uint32_t>> class_lookup_;
 };
 
 class OatFileAnalyzer {

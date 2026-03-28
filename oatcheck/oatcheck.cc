@@ -65,7 +65,7 @@ struct DexSymId {
   void SetDexFileIndex(uint32_t dex_file_index) {
     id = (id & 0x00FFFFFF) | (dex_file_index << 24);
   }
-  uint32_t GetDexFileIndex() {
+  uint32_t GetDexFileIndex() const {
     return (id >> 24) & 0xFF;
   }
   bool IsMethod() const {
@@ -73,6 +73,9 @@ struct DexSymId {
   }
   void SetSymId(uint32_t sym_id) {
     id = (id & 0xFFFF0000) | (sym_id & 0x0000FFFF);
+  }
+  uint32_t GetSymId() const {
+    return id & 0x0000FFFF;
   }
   DexSymId(uint32_t dex_file_index, bool is_method, uint32_t sym_id) : id(0) {
     SetDexFileIndex(dex_file_index);
@@ -202,6 +205,42 @@ class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge
   friend class DependencyGraphPropagator;
 };
 
+class BcpDependencyGraph : public DependencyGraph {
+ public:
+  BcpDependencyGraph() = default;
+  ~BcpDependencyGraph() = default;
+
+  // Set dex files reference for ClassAccessor construction
+  void SetDexFiles(const std::vector<std::unique_ptr<const art::DexFile>>* dex_files) {
+    dex_files_ = dex_files;
+  }
+
+  // Construct ClassAccessor from DexSymId
+  // DexSymId encodes: dex_file_index in high bits, class_def_index in low bits
+  art::ClassAccessor GetClassAccessor(const DexSymId& dex_sym_id) const {
+    uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
+    uint32_t class_def_index = dex_sym_id.GetSymId();
+
+    const art::DexFile* dex = dex_files_->at(dex_file_index).get();
+    return art::ClassAccessor(*dex, class_def_index);
+  }
+
+  // Check if DexSymId is valid (within bounds)
+  bool HasClassAccessor(const DexSymId& dex_sym_id) const {
+    uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
+    uint32_t class_def_index = dex_sym_id.GetSymId();
+
+    if (dex_file_index >= dex_files_->size()) {
+      return false;
+    }
+    const art::DexFile* dex = dex_files_->at(dex_file_index).get();
+    return class_def_index < dex->NumClassDefs();
+  }
+
+ private:
+  const std::vector<std::unique_ptr<const art::DexFile>>* dex_files_ = nullptr;
+};
+
 class DependencyGraphBuilder {
  public:
   DependencyGraphBuilder(const char* apk_file_path, DependencyGraph* graph)
@@ -274,6 +313,32 @@ class DependencyGraphBuilder {
       graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
       // Edge from subclass to superclass: subclass depends on superclass
       graph_.UpdateEdge(class_dex_sym_id, superclass_dex_sym_id, std::bitset<3>(7));
+    }
+    return true;
+  }
+  bool AnalyzeDexClasses1(const art::DexFile* dex,ATTRIBUTE_UNUSED size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    // Build dependency edges based on class hierarchy.
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      // TODO: Handle interfaces
+      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
+      for (const art::ClassAccessor::Field& field : accessor.GetStaticFields()) {
+        uint32_t field_idx = field.GetIndex();
+        const char* field_name = dex->GetFieldName(field_idx);
+        // Use field_name here
+        (void)field_name;
+      }
+      for (const art::ClassAccessor::Field& field : accessor.GetInstanceFields()) {
+        uint32_t field_idx = field.GetIndex();
+        const char* field_name = dex->GetFieldName(field_idx);
+        // Use field_name here
+        (void)field_name;
+      }
+      for (const art::ClassAccessor::Method& method : accessor.GetVirtualMethods()) {
+        uint32_t method_idx = method.GetIndex();
+        const char* method_name = dex->GetMethodName(method_idx);
+        // Use method_name here
+        (void)method_name;
+      }
     }
     return true;
   }

@@ -573,6 +573,18 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     // - Compare virtual table layout
     // Then set the appropriate bits in the changes_ bitset
     //
+    // Static field layout changes if:
+    //  a. number of static fields changed
+    //  b. if number of static fields stay the same, then any of new static field doesnt match cooresponding old static field
+    //
+    // Instance field layout changes if:
+    //  a. number of instance fields changed
+    //  b. if number of instance fields stay the same, then any of new instance field doesnt match cooresponding old instance field
+    //
+    // VTable field layout changes if:
+    //  a. number of virtual methods changed
+    //  b. if number of virtual methods stay the same, then any of new virtual method doesnt match corresponding old instance field
+
     // For now, this is a placeholder that sets all change bits as an example:
     // auto& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
     // vertex.changes_.set();  // Mark as changed with all dependency types

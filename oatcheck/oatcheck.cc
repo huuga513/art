@@ -41,6 +41,7 @@
 #include "dex/dex_instruction.h"
 #include "dex/dex_instruction_iterator.h"
 #include "dex/dex_instruction_utils.h"
+#include "dex/signature.h"
 #include "graaflib/algorithm/topological_sorting/dfs_topological_sorting.h"
 #include "graaflib/graph.h"
 #include "graaflib/types.h"
@@ -102,6 +103,7 @@ class DependencyGraphNode {
   std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)> changes_;
   friend class DependencyGraphPropagator;
   friend class DependencyGraphBuilder;
+  friend class BcpDependencyGraphPropagator;
 };
 
 // Caches all boot classpath class descriptors for fast lookup
@@ -564,13 +566,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   }
 
   // Compare old and new class definitions using ClassAccessor and mark changes
-  void CompareAndMarkChanges(ATTRIBUTE_UNUSED const DexSymId& old_dex_sym_id,
-                             ATTRIBUTE_UNUSED const art::ClassAccessor& old_class_accessor,
-                             ATTRIBUTE_UNUSED const art::ClassAccessor& new_class_accessor) {
-    // TODO: Implement comparison logic using ClassAccessor
-    // - Compare static field layout
-    // - Compare instance field layout
-    // - Compare virtual table layout
+  void CompareAndMarkChanges(const DexSymId& old_dex_sym_id,
+                             const art::ClassAccessor& old_class_accessor,
+                             const art::ClassAccessor& new_class_accessor) {
     // Then set the appropriate bits in the changes_ bitset
     //
     // Static field layout changes if:
@@ -585,9 +583,91 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     //  a. number of virtual methods changed
     //  b. if number of virtual methods stay the same, then any of new virtual method doesnt match corresponding old instance field
 
-    // For now, this is a placeholder that sets all change bits as an example:
-    // auto& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
-    // vertex.changes_.set();  // Mark as changed with all dependency types
+    DependencyGraphNode& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
+
+    // Compare static field layout
+    bool static_fields_changed = false;
+    uint32_t old_static_count = old_class_accessor.NumStaticFields();
+    uint32_t new_static_count = new_class_accessor.NumStaticFields();
+    if (old_static_count != new_static_count) {
+      static_fields_changed = true;
+    } else {
+      auto old_static_fields = old_class_accessor.GetStaticFields();
+      auto new_static_fields = new_class_accessor.GetStaticFields();
+      auto old_it = old_static_fields.begin();
+      auto new_it = new_static_fields.begin();
+      for (; old_it != old_static_fields.end() && new_it != new_static_fields.end(); ++old_it, ++new_it) {
+        const art::dex::FieldId& old_field_id = old_class_accessor.GetDexFile().GetFieldId(old_it->GetIndex());
+        const art::dex::FieldId& new_field_id = new_class_accessor.GetDexFile().GetFieldId(new_it->GetIndex());
+        const char* old_name = old_class_accessor.GetDexFile().GetFieldName(old_field_id);
+        const char* new_name = new_class_accessor.GetDexFile().GetFieldName(new_field_id);
+        const char* old_type = old_class_accessor.GetDexFile().GetFieldTypeDescriptor(old_field_id);
+        const char* new_type = new_class_accessor.GetDexFile().GetFieldTypeDescriptor(new_field_id);
+        if (strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
+          static_fields_changed = true;
+          break;
+        }
+      }
+    }
+    if (static_fields_changed) {
+      vertex.changes_.set(static_cast<size_t>(DependencyType::kStaticFieldLayout));
+    }
+
+    // Compare instance field layout
+    bool instance_fields_changed = false;
+    uint32_t old_instance_count = old_class_accessor.NumInstanceFields();
+    uint32_t new_instance_count = new_class_accessor.NumInstanceFields();
+    if (old_instance_count != new_instance_count) {
+      instance_fields_changed = true;
+    } else {
+      auto old_instance_fields = old_class_accessor.GetInstanceFields();
+      auto new_instance_fields = new_class_accessor.GetInstanceFields();
+      auto old_it = old_instance_fields.begin();
+      auto new_it = new_instance_fields.begin();
+      for (; old_it != old_instance_fields.end() && new_it != new_instance_fields.end(); ++old_it, ++new_it) {
+        const art::dex::FieldId& old_field_id = old_class_accessor.GetDexFile().GetFieldId(old_it->GetIndex());
+        const art::dex::FieldId& new_field_id = new_class_accessor.GetDexFile().GetFieldId(new_it->GetIndex());
+        const char* old_name = old_class_accessor.GetDexFile().GetFieldName(old_field_id);
+        const char* new_name = new_class_accessor.GetDexFile().GetFieldName(new_field_id);
+        const char* old_type = old_class_accessor.GetDexFile().GetFieldTypeDescriptor(old_field_id);
+        const char* new_type = new_class_accessor.GetDexFile().GetFieldTypeDescriptor(new_field_id);
+        if (strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
+          instance_fields_changed = true;
+          break;
+        }
+      }
+    }
+    if (instance_fields_changed) {
+      vertex.changes_.set(static_cast<size_t>(DependencyType::kInstanceFieldLayout));
+    }
+
+    // Compare virtual table layout
+    bool vtable_changed = false;
+    uint32_t old_virtual_count = old_class_accessor.NumVirtualMethods();
+    uint32_t new_virtual_count = new_class_accessor.NumVirtualMethods();
+    if (old_virtual_count != new_virtual_count) {
+      vtable_changed = true;
+    } else {
+      auto old_virtual_methods = old_class_accessor.GetVirtualMethods();
+      auto new_virtual_methods = new_class_accessor.GetVirtualMethods();
+      auto old_it = old_virtual_methods.begin();
+      auto new_it = new_virtual_methods.begin();
+      for (; old_it != old_virtual_methods.end() && new_it != new_virtual_methods.end(); ++old_it, ++new_it) {
+        const art::dex::MethodId& old_method_id = old_class_accessor.GetDexFile().GetMethodId(old_it->GetIndex());
+        const art::dex::MethodId& new_method_id = new_class_accessor.GetDexFile().GetMethodId(new_it->GetIndex());
+        const char* old_name = old_class_accessor.GetDexFile().GetMethodName(old_method_id);
+        const char* new_name = new_class_accessor.GetDexFile().GetMethodName(new_method_id);
+        const Signature old_signature = old_class_accessor.GetDexFile().GetMethodSignature(old_method_id);
+        const Signature new_signature = new_class_accessor.GetDexFile().GetMethodSignature(new_method_id);
+        if (strcmp(old_name, new_name) != 0 || old_signature != new_signature) {
+          vtable_changed = true;
+          break;
+        }
+      }
+    }
+    if (vtable_changed) {
+      vertex.changes_.set(static_cast<size_t>(DependencyType::kVirtualTableLayout));
+    }
   }
 
   BcpDependencyGraph& bcp_graph_;

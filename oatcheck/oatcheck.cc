@@ -241,6 +241,102 @@ class BcpDependencyGraph : public DependencyGraph {
 
  private:
   const std::vector<std::unique_ptr<const art::DexFile>>* dex_files_ = nullptr;
+  friend class BcpDependencyGraphBuilder;
+};
+
+class BcpDependencyGraphBuilder {
+ public:
+  BcpDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths, BcpDependencyGraph* bcp_graph)
+      : jar_file_paths_(jar_file_paths), bcp_graph_(*bcp_graph) {}
+
+  const std::vector<std::unique_ptr<const art::DexFile>>& GetDexFiles() const {
+    return dex_files_;
+  }
+
+  bool BuildGraph(std::string* error_msg) {
+    if (!ExtractDexFromJars(error_msg)) {
+      return false;
+    }
+
+    // Set the dex files reference on BcpDependencyGraph
+    bcp_graph_.SetDexFiles(&dex_files_);
+
+    size_t i = 0;
+    for (const auto& dex : dex_files_) {
+      if (!AnalyzeDexClasses(dex.get(), i, error_msg)) {
+        LOG(ERROR) << "Failed to analyze DEX classes: " << *error_msg;
+        return false;
+      }
+      i++;
+    }
+    LOG(INFO) << "BcpDependencyGraph built: " << bcp_graph_.Summary();
+    return true;
+  }
+
+ private:
+  // Extract all classes*.dex from all JAR files into `dex_files_`.
+  bool ExtractDexFromJars(std::string* error_msg) {
+    for (const char* jar_file_path : jar_file_paths_) {
+      if (jar_file_path == nullptr) {
+        continue;
+      }
+
+      // Create DexFileLoader with JAR path as location
+      art::DexFileLoader loader(jar_file_path, /*location=*/jar_file_path);
+
+      // Open all DEX files in the JAR container
+      std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
+      bool success = loader.Open(
+          /*verify=*/true,
+          /*verify_checksum=*/true,
+          /*allow_no_dex_files=*/false,
+          error_msg,
+          &jar_dex_files);
+
+      if (!success || jar_dex_files.empty()) {
+        LOG(ERROR) << "Failed to load DEX from JAR " << jar_file_path << ": " << *error_msg;
+        return false;
+      }
+
+      LOG(INFO) << "Loaded " << jar_dex_files.size() << " DEX file(s) from " << jar_file_path;
+
+      // Move loaded dex files to the global list
+      for (auto& dex : jar_dex_files) {
+        dex_files_.push_back(std::move(dex));
+      }
+    }
+
+    if (dex_files_.empty()) {
+      *error_msg = "No DEX files loaded from any JAR files";
+      return false;
+    }
+
+    return true;
+  }
+
+  bool AnalyzeDexClasses(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    // Build dependency edges based on class hierarchy.
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      // TODO: Handle interfaces
+      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
+      const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
+      const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
+      const char* class_descriptor = accessor.GetDescriptor();
+      DexSymId superclass_dex_sym_id(dex_file_idx, false,
+                                    class_def.superclass_idx_.index_);
+      DexSymId class_dex_sym_id(dex_file_idx, false,
+                                 accessor.GetClassIdx().index_);
+      bcp_graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
+      bcp_graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+      // Edge from subclass to superclass: subclass depends on superclass
+      bcp_graph_.UpdateEdge(class_dex_sym_id, superclass_dex_sym_id, std::bitset<3>(7));
+    }
+    return true;
+  }
+
+  std::vector<const char*> jar_file_paths_;
+  std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
+  BcpDependencyGraph& bcp_graph_;
 };
 
 class DependencyGraphBuilder {
@@ -998,6 +1094,8 @@ struct OatCheckArgs : public CmdlineArgs {
       oat_file_ = raw_option + strlen("--oat=");
     } else if (option.starts_with("--system=")) {
       system_dir_ = raw_option + strlen("--system=");
+    } else if (option.starts_with("--updated-boot-classes=")) {
+      updated_boot_classes_dir_ = raw_option + strlen("--updated-boot-classes=");
     } else if (option.starts_with("--output=")) {
       output_file_ = raw_option + strlen("--output=");
     } else if (option.starts_with("--apk=")) {
@@ -1042,13 +1140,14 @@ Examples:
   oatcheck --dex=classes.dex --oat=base.odex
 
 Options:
-  --apk=<file>        Path to APK file (will extract all classes*.dex)
-  --dex=<file>        Path to DEX file (can be repeated)
-  --oat=<file>        Path to OAT/ODEX file
-  --system=<dir>      Root of system partition (e.g., /system)
-  --output=<file>     Write result to file (default: stdout)
-  --verbose, -v       Enable verbose logging
-  --help, -h          Show this message
+  --apk=<file>                  Path to APK file (will extract all classes*.dex)
+  --dex=<file>                  Path to DEX file (can be repeated)
+  --oat=<file>                  Path to OAT/ODEX file
+  --system=<dir>                Root of original system partition (e.g., /system)
+  --updated-boot-classes=<dir>  Path to directory containing updated boot classpath JARs
+  --output=<file>               Write result to file (default: stdout)
+  --verbose, -v                 Enable verbose logging
+  --help, -h                    Show this message
 )";
   }
 
@@ -1058,6 +1157,7 @@ Options:
   std::vector<const char*> dex_files_;
   const char* oat_file_ = nullptr;
   const char* system_dir_ = nullptr;
+  const char* updated_boot_classes_dir_ = nullptr;
   const char* output_file_ = nullptr;
   const char* apk_file_ = nullptr;
 
@@ -1142,6 +1242,96 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "OAT: " << args_->oat_file_ << "\n";
     if (args_->system_dir_)
       *os << "System: " << args_->system_dir_ << "\n";
+    if (args_->updated_boot_classes_dir_)
+      *os << "Updated boot classes: " << args_->updated_boot_classes_dir_ << "\n";
+
+    // BCP change detection flow
+    if (args_->system_dir_ != nullptr && args_->updated_boot_classes_dir_ != nullptr) {
+      LOG(INFO) << "Starting BCP change detection...";
+
+      // List of standard BCP JAR files
+      const std::vector<std::string> kBootClasspathJars = {
+        "core-oj.jar",
+        "core-libart.jar",
+        "conscrypt.jar",
+        "okhttp.jar",
+        "bouncycastle.jar",
+        "apache-xml.jar",
+        "ext.jar",
+        "framework.jar",
+        "telephony-common.jar",
+        "voip-common.jar",
+        "ims-common.jar",
+        "android.hidl.base-V1.0-java.jar"
+      };
+
+      // Collect original BCP JAR paths
+      std::vector<const char*> original_bcp_jars;
+      std::vector<std::string> original_paths_storage; // To keep strings alive
+      for (const auto& jar_name : kBootClasspathJars) {
+        std::string full_path = std::string(args_->system_dir_) + "/framework/" + jar_name;
+        original_paths_storage.push_back(full_path);
+        original_bcp_jars.push_back(original_paths_storage.back().c_str());
+      }
+
+      // Build original BCP dependency graph
+      BcpDependencyGraph original_bcp_graph;
+      BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, &original_bcp_graph);
+      if (!bcp_builder.BuildGraph(&error_msg)) {
+        LOG(ERROR) << "Failed to build original BCP dependency graph: " << error_msg;
+        return false;
+      }
+      LOG(INFO) << "Original BCP graph built: " << original_bcp_graph.Summary();
+
+      // Load updated BCP DEX files
+      std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
+      for (const auto& jar_name : kBootClasspathJars) {
+        std::string jar_path = std::string(args_->updated_boot_classes_dir_) + "/" + jar_name;
+        art::DexFileLoader loader(jar_path.c_str(), jar_path.c_str());
+        std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
+        if (!loader.Open(/*verify=*/true, /*verify_checksum=*/true, /*allow_no_dex_files=*/true, &error_msg, &jar_dex_files)) {
+          LOG(WARNING) << "Failed to load updated JAR " << jar_path << ": " << error_msg << ", skipping";
+          continue;
+        }
+        for (auto& dex : jar_dex_files) {
+          updated_boot_dex_files.push_back(std::move(dex));
+        }
+      }
+
+      if (updated_boot_dex_files.empty()) {
+        LOG(ERROR) << "No DEX files loaded from updated boot classes directory";
+        return false;
+      }
+      LOG(INFO) << "Loaded " << updated_boot_dex_files.size() << " updated BCP DEX files";
+
+      // Run change detection and propagation
+      BcpDependencyGraphPropagator propagator(&original_bcp_graph, updated_boot_dex_files);
+      propagator.SetInitialChanges();
+      propagator.PropagateChanges();
+      LOG(INFO) << "BCP change propagation complete";
+
+      // Collect and report results
+      size_t changed_classes = 0;
+      size_t changed_methods = 0;
+      for (const auto& [vertex_id, vertex] : original_bcp_graph.GetVertices()) {
+        if (vertex.IsChanged()) {
+          DexSymId sym_id(vertex_id);
+          if (sym_id.IsMethod()) {
+            changed_methods++;
+          } else {
+            changed_classes++;
+          }
+          if (args_->verbose_) {
+            LOG(INFO) << "Changed: " << vertex.GetDescriptor();
+          }
+        }
+      }
+
+      *os << "\nBCP Change Detection Results:\n";
+      *os << "  Changed classes: " << changed_classes << "\n";
+      *os << "  Changed methods: " << changed_methods << "\n";
+      *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
+    }
 
     *os << "Done.\n";
     return true;

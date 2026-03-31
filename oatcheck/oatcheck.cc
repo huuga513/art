@@ -42,6 +42,7 @@
 #include "dex/dex_instruction_iterator.h"
 #include "dex/dex_instruction_utils.h"
 #include "dex/signature.h"
+#include "dex/signature-inl.h"
 #include "graaflib/algorithm/topological_sorting/dfs_topological_sorting.h"
 #include "graaflib/graph.h"
 #include "graaflib/types.h"
@@ -1068,6 +1069,51 @@ class InlineCallGraphBuilder {
   const art::OatFile& oat_file_;
   const std::vector<std::unique_ptr<const art::DexFile>>& dex_files_;
 };
+// BootClassPath from lynx device, matches list_bcp_classes.py
+const std::vector<std::string> kBootClasspathJars = {
+  "/apex/com.android.art/javalib/core-oj.jar",
+  "/apex/com.android.art/javalib/core-libart.jar",
+  "/apex/com.android.art/javalib/okhttp.jar",
+  "/apex/com.android.art/javalib/bouncycastle.jar",
+  "/apex/com.android.art/javalib/apache-xml.jar",
+  "/system/framework/framework.jar",
+  "/system/framework/framework-graphics.jar",
+  "/system/framework/framework-location.jar",
+  "/system/framework/ext.jar",
+  "/system/framework/telephony-common.jar",
+  "/system/framework/voip-common.jar",
+  "/system/framework/ims-common.jar",
+  "/apex/com.android.i18n/javalib/core-icu4j.jar",
+  "/apex/com.android.adservices/javalib/framework-adservices.jar",
+  "/apex/com.android.adservices/javalib/framework-sdksandbox.jar",
+  "/apex/com.android.appsearch/javalib/framework-appsearch.jar",
+  "/apex/com.android.btservices/javalib/framework-bluetooth.jar",
+  "/apex/com.android.configinfrastructure/javalib/framework-configinfrastructure.jar",
+  "/apex/com.android.conscrypt/javalib/conscrypt.jar",
+  "/apex/com.android.crashrecovery/javalib/framework-crashrecovery.jar",
+  "/apex/com.android.devicelock/javalib/framework-devicelock.jar",
+  "/apex/com.android.healthfitness/javalib/framework-healthfitness.jar",
+  "/apex/com.android.ipsec/javalib/android.net.ipsec.ike.jar",
+  "/apex/com.android.media/javalib/updatable-media.jar",
+  "/apex/com.android.mediaprovider/javalib/framework-mediaprovider.jar",
+  "/apex/com.android.mediaprovider/javalib/framework-pdf.jar",
+  "/apex/com.android.mediaprovider/javalib/framework-pdf-v.jar",
+  "/apex/com.android.nfcservices/javalib/framework-nfc.jar",
+  "/apex/com.android.ondevicepersonalization/javalib/framework-ondevicepersonalization.jar",
+  "/apex/com.android.os.statsd/javalib/framework-statsd.jar",
+  "/apex/com.android.permission/javalib/framework-permission.jar",
+  "/apex/com.android.permission/javalib/framework-permission-s.jar",
+  "/apex/com.android.profiling/javalib/framework-profiling.jar",
+  "/apex/com.android.scheduling/javalib/framework-scheduling.jar",
+  "/apex/com.android.sdkext/javalib/framework-sdkextensions.jar",
+  "/apex/com.android.tethering/javalib/framework-connectivity.jar",
+  "/apex/com.android.tethering/javalib/framework-connectivity-t.jar",
+  "/apex/com.android.tethering/javalib/framework-tethering.jar",
+  "/apex/com.android.uwb/javalib/framework-uwb.jar",
+  "/apex/com.android.virt/javalib/framework-virtualization.jar",
+  "/apex/com.android.wifi/javalib/framework-wifi.jar"
+};
+
 enum class OatCheckMode {
   kDefault,
   kVerbose,
@@ -1092,14 +1138,14 @@ struct OatCheckArgs : public CmdlineArgs {
       dex_files_.push_back(raw_option + strlen("--dex="));
     } else if (option.starts_with("--oat=")) {
       oat_file_ = raw_option + strlen("--oat=");
-    } else if (option.starts_with("--system=")) {
-      system_dir_ = raw_option + strlen("--system=");
-    } else if (option.starts_with("--updated-boot-classes=")) {
-      updated_boot_classes_dir_ = raw_option + strlen("--updated-boot-classes=");
     } else if (option.starts_with("--output=")) {
       output_file_ = raw_option + strlen("--output=");
     } else if (option.starts_with("--apk=")) {
       apk_file_ = raw_option + strlen("--apk=");
+    } else if (option.starts_with("--origin-bcp-prefix=")) {
+      origin_bcp_prefix_ = raw_option + strlen("--origin-bcp-prefix=");
+    } else if (option.starts_with("--updated-bcp-prefix=")) {
+      updated_bcp_prefix_ = raw_option + strlen("--updated-bcp-prefix=");
     }
     // TODO: Add more options.
 
@@ -1120,9 +1166,15 @@ struct OatCheckArgs : public CmdlineArgs {
       return kParseOk;
     }
 
-    if (dex_files_.empty() && oat_file_ == nullptr && system_dir_ == nullptr &&
-        apk_file_ == nullptr) {
-      *error_msg = "At least one of --dex, --oat, --system, or --apk must be specified.";
+    if (dex_files_.empty() && oat_file_ == nullptr && apk_file_ == nullptr && origin_bcp_prefix_ == nullptr) {
+      *error_msg = "At least one of --dex, --oat, --apk, or --origin-bcp-prefix must be specified.";
+      return kParseError;
+    }
+
+    // Check that if one BCP prefix is provided, the other is too
+    if ((origin_bcp_prefix_ != nullptr && updated_bcp_prefix_ == nullptr) ||
+        (origin_bcp_prefix_ == nullptr && updated_bcp_prefix_ != nullptr)) {
+      *error_msg = "Both --origin-bcp-prefix and --updated-bcp-prefix must be specified together.";
       return kParseError;
     }
 
@@ -1143,8 +1195,8 @@ Options:
   --apk=<file>                  Path to APK file (will extract all classes*.dex)
   --dex=<file>                  Path to DEX file (can be repeated)
   --oat=<file>                  Path to OAT/ODEX file
-  --system=<dir>                Root of original system partition (e.g., /system)
-  --updated-boot-classes=<dir>  Path to directory containing updated boot classpath JARs
+  --origin-bcp-prefix=<dir>     Prefix path for original BootClassPath jars (e.g., $ANDROID_PRODUCT_OUT)
+  --updated-bcp-prefix=<dir>    Prefix path for updated BootClassPath jars
   --output=<file>               Write result to file (default: stdout)
   --verbose, -v                 Enable verbose logging
   --help, -h                    Show this message
@@ -1156,10 +1208,10 @@ Options:
   bool verbose_ = false;
   std::vector<const char*> dex_files_;
   const char* oat_file_ = nullptr;
-  const char* system_dir_ = nullptr;
-  const char* updated_boot_classes_dir_ = nullptr;
   const char* output_file_ = nullptr;
   const char* apk_file_ = nullptr;
+  const char* origin_bcp_prefix_ = nullptr;
+  const char* updated_bcp_prefix_ = nullptr;
 
   OatCheckMode GetMode() const {
     if (verbose_) {
@@ -1240,36 +1292,27 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     if (args_->oat_file_)
       *os << "OAT: " << args_->oat_file_ << "\n";
-    if (args_->system_dir_)
-      *os << "System: " << args_->system_dir_ << "\n";
-    if (args_->updated_boot_classes_dir_)
-      *os << "Updated boot classes: " << args_->updated_boot_classes_dir_ << "\n";
+    if (args_->origin_bcp_prefix_)
+      *os << "Original BCP prefix: " << args_->origin_bcp_prefix_ << "\n";
+    if (args_->updated_bcp_prefix_)
+      *os << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
 
     // BCP change detection flow
-    if (args_->system_dir_ != nullptr && args_->updated_boot_classes_dir_ != nullptr) {
+    if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
       LOG(INFO) << "Starting BCP change detection...";
-
-      // List of standard BCP JAR files
-      const std::vector<std::string> kBootClasspathJars = {
-        "core-oj.jar",
-        "core-libart.jar",
-        "conscrypt.jar",
-        "okhttp.jar",
-        "bouncycastle.jar",
-        "apache-xml.jar",
-        "ext.jar",
-        "framework.jar",
-        "telephony-common.jar",
-        "voip-common.jar",
-        "ims-common.jar",
-        "android.hidl.base-V1.0-java.jar"
-      };
 
       // Collect original BCP JAR paths
       std::vector<const char*> original_bcp_jars;
       std::vector<std::string> original_paths_storage; // To keep strings alive
-      for (const auto& jar_name : kBootClasspathJars) {
-        std::string full_path = std::string(args_->system_dir_) + "/framework/" + jar_name;
+
+      std::string origin_prefix = args_->origin_bcp_prefix_;
+      // Ensure prefix ends with /
+      if (!origin_prefix.empty() && origin_prefix.back() != '/') {
+        origin_prefix += '/';
+      }
+      for (const auto& jar_relative_path : kBootClasspathJars) {
+        // jar_relative_path starts with /, so we need to skip it when joining
+        std::string full_path = origin_prefix + jar_relative_path.substr(1);
         original_paths_storage.push_back(full_path);
         original_bcp_jars.push_back(original_paths_storage.back().c_str());
       }
@@ -1285,8 +1328,14 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
       // Load updated BCP DEX files
       std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
-      for (const auto& jar_name : kBootClasspathJars) {
-        std::string jar_path = std::string(args_->updated_boot_classes_dir_) + "/" + jar_name;
+      std::string updated_prefix = args_->updated_bcp_prefix_;
+      // Ensure prefix ends with /
+      if (!updated_prefix.empty() && updated_prefix.back() != '/') {
+        updated_prefix += '/';
+      }
+      for (const auto& jar_relative_path : kBootClasspathJars) {
+        // jar_relative_path starts with /, so we need to skip it when joining
+        std::string jar_path = updated_prefix + jar_relative_path.substr(1);
         art::DexFileLoader loader(jar_path.c_str(), jar_path.c_str());
         std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
         if (!loader.Open(/*verify=*/true, /*verify_checksum=*/true, /*allow_no_dex_files=*/true, &error_msg, &jar_dex_files)) {

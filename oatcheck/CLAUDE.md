@@ -79,3 +79,5 @@ Use oatcheck/test_dex_loader_host.py to run the test in text_dex_loader.cc:
 ```bash
 oatcheck/test_dex_loader_host.py --dex=[dex file]
 ```
+## Dont remove include statements of include xxx-inl.h
+If mcp tells u some of xxx-inl.h never been used, dont care. It is a false positive.

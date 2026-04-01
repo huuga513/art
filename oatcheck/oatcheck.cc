@@ -333,11 +333,26 @@ class BcpDependencyGraphBuilder {
       uint32_t class_def_index = accessor.GetClassDefIndex();
       const char* class_descriptor = accessor.GetDescriptor();
       DexSymId class_dex_sym_id(dex_file_idx, false, class_def_index);
-      descriptor_to_symid_.emplace(class_descriptor,class_dex_sym_id);
+      descriptor_to_symid_.emplace(class_descriptor, class_dex_sym_id);
       // Also add vertex for the class itself
       bcp_graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
     }
     return true;
+  }
+
+  // Get or create DexSymId for a descriptor.
+  // If found in mapping, returns existing DexSymId.
+  // If not found, creates external DexSymId (dex_file_index = 0xFF, unique sym_id) and stores it.
+  DexSymId GetOrCreateDexSymId(const std::string& descriptor) {
+    auto it = descriptor_to_symid_.find(descriptor);
+    if (it != descriptor_to_symid_.end()) {
+      return it->second;
+    }
+    // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
+    DexSymId external_symid(static_cast<uint32_t>(0xFF), false, external_class_counter_);
+    descriptor_to_symid_.emplace(descriptor, external_symid);
+    external_class_counter_++;
+    return external_symid;
   }
 
   // Step 2: Build dependency edges using the descriptor mapping.
@@ -357,17 +372,7 @@ class BcpDependencyGraphBuilder {
       // Handle superclass
       if (class_def.superclass_idx_ != dex::TypeIndex::Invalid()) {
         const char* superclass_descriptor = dex->GetTypeDescriptor(class_def.superclass_idx_);
-        DexSymId superclass_dex_sym_id(0,false,0);
-
-        // Look up superclass in descriptor mapping
-        auto super_it = descriptor_to_symid_.find(superclass_descriptor);
-        if (super_it != descriptor_to_symid_.end()) {
-          // Found in app dex files - use the DexSymId
-          superclass_dex_sym_id = super_it->second;
-        } else {
-          // Not found - create external class marker (dex_file_index = 0xFF)
-          superclass_dex_sym_id = DexSymId(static_cast<uint32_t>(0xFF), false, 0);
-        }
+        DexSymId superclass_dex_sym_id = GetOrCreateDexSymId(superclass_descriptor);
 
         // Add vertex for superclass (if external, still need vertex for graph completeness)
         bcp_graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
@@ -398,6 +403,9 @@ class BcpDependencyGraphBuilder {
   // Descriptor -> DexSymId mapping for O(1) lookup
   // This maps class descriptors to their DexSymId (using class_def_index)
   std::unordered_map<std::string, DexSymId> descriptor_to_symid_;
+
+  // Counter for assigning unique sym_ids to external classes
+  uint32_t external_class_counter_ = 0;
 };
 
 class DependencyGraphBuilder {
@@ -636,6 +644,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   }
 
   void SetInitialChanges() override {
+    size_t initial_changed_class_counter = 0;
     // Iterate through all class nodes in BcpDependencyGraph
     for (const auto& [vertex_id, vertex] : bcp_graph_.GetVertices()) {
       // Create DexSymId from vertex_id
@@ -658,12 +667,16 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         art::ClassAccessor old_class_accessor = bcp_graph_.GetClassAccessor(dex_sym_id);
         // Create ClassAccessor for new class from updated_boot_dex_files
         art::ClassAccessor new_class_accessor(*found_dex, found_class_def_idx);
-        CompareAndMarkChanges(dex_sym_id, old_class_accessor, new_class_accessor);
+        bool changes_found = CompareAndMarkChanges(dex_sym_id, old_class_accessor, new_class_accessor);
+        if (changes_found) {
+          initial_changed_class_counter += 1;
+        }
       } else {
         // Class not found in new DexFiles - mark as changed
         // TODO: This might need special handling
       }
     }
+    LOG(INFO) << "Found "<<initial_changed_class_counter<<"(s) initial changed classes";
   }
 
  private:
@@ -681,7 +694,8 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   }
 
   // Compare old and new class definitions using ClassAccessor and mark changes
-  void CompareAndMarkChanges(const DexSymId& old_dex_sym_id,
+  // Return true if any change found
+  bool CompareAndMarkChanges(const DexSymId& old_dex_sym_id,
                              const art::ClassAccessor& old_class_accessor,
                              const art::ClassAccessor& new_class_accessor) {
     // Then set the appropriate bits in the changes_ bitset
@@ -867,6 +881,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         }
       }
     }
+    return static_fields_changed || instance_fields_changed || vtable_changed;
   }
 
   BcpDependencyGraph& bcp_graph_;

@@ -329,8 +329,8 @@ class BcpDependencyGraphBuilder {
                                  accessor.GetClassIdx().index_);
       bcp_graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
       bcp_graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-      // Edge from subclass to superclass: subclass depends on superclass
-      bcp_graph_.UpdateEdge(class_dex_sym_id, superclass_dex_sym_id, std::bitset<3>(7));
+      // Edge from superclass to subclass: subclass depends on superclass
+      bcp_graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
     }
     return true;
   }
@@ -410,34 +410,8 @@ class DependencyGraphBuilder {
                                  accessor.GetClassIdx().index_);
       graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
       graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-      // Edge from subclass to superclass: subclass depends on superclass
-      graph_.UpdateEdge(class_dex_sym_id, superclass_dex_sym_id, std::bitset<3>(7));
-    }
-    return true;
-  }
-  bool AnalyzeDexClasses1(const art::DexFile* dex,ATTRIBUTE_UNUSED size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
-    // Build dependency edges based on class hierarchy.
-    for (art::ClassAccessor accessor : dex->GetClasses()) {
-      // TODO: Handle interfaces
-      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
-      for (const art::ClassAccessor::Field& field : accessor.GetStaticFields()) {
-        uint32_t field_idx = field.GetIndex();
-        const char* field_name = dex->GetFieldName(field_idx);
-        // Use field_name here
-        (void)field_name;
-      }
-      for (const art::ClassAccessor::Field& field : accessor.GetInstanceFields()) {
-        uint32_t field_idx = field.GetIndex();
-        const char* field_name = dex->GetFieldName(field_idx);
-        // Use field_name here
-        (void)field_name;
-      }
-      for (const art::ClassAccessor::Method& method : accessor.GetVirtualMethods()) {
-        uint32_t method_idx = method.GetIndex();
-        const char* method_name = dex->GetMethodName(method_idx);
-        // Use method_name here
-        (void)method_name;
-      }
+      // Edge from superclass to subclass: subclass depends on superclass
+      graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
     }
     return true;
   }
@@ -467,10 +441,10 @@ class DependencyGraphBuilder {
                 DexSymId class_dex_sym_id(dex_file_idx, false, method_id.class_idx_.index_);
                 graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
-                // Edge from method to class: method depends on class (for virtual table layout)
+                // Edge from class to method: method depends on class (for virtual table layout)
                 graph_.UpdateEdge(
-                    method_dex_sym_id,
                     class_dex_sym_id,
+                    method_dex_sym_id,
                     std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
                 break;
               }
@@ -509,10 +483,10 @@ class DependencyGraphBuilder {
             DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
             graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
-            // Edge from method to class: method depends on class (for instance field layout)
+            // Edge from class to method: method depends on class (for instance field layout)
             graph_.UpdateEdge(
-                method_dex_sym_id,
                 class_dex_sym_id,
+                method_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
           } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
             auto field_idx = inst->VRegB();
@@ -523,10 +497,10 @@ class DependencyGraphBuilder {
             DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
             graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
-            // Edge from method to class: method depends on class (for static field layout)
+            // Edge from class to method: method depends on class (for static field layout)
             graph_.UpdateEdge(
-                method_dex_sym_id,
                 class_dex_sym_id,
+                method_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
           }
         }
@@ -566,8 +540,8 @@ class DependencyGraphPropagator {
 
   void PropagateChanges() {
     // Propagate changes through the dependency graph.
-    // Edge X → Y means X depends on Y, so if Y changes, X is also affected.
-    // We propagate changes in reverse topological order.
+    // Edge Y → X means X depends on Y, so if Y changes, X is also affected.
+    // We propagate changes in topological order.
     auto& inner_graph = graph_.graph_;
     auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(
         graph_.graph_);
@@ -577,18 +551,18 @@ class DependencyGraphPropagator {
     }
     const std::vector<graaf::vertex_id_t>& topo = result.value();
 
-    // Iterate in reverse topological order
-    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+    // Iterate in topological order
+    for (auto it = topo.begin(); it != topo.end(); ++it) {
       graaf::vertex_id_t id = *it;
       auto& vertex = inner_graph.get_vertex(id);
 
-      // For all predecessors (X where X → id, meaning X depends on id)
+      // For all successors (X where id → X, meaning X depends on id)
       // If id has changes, X also gets those changes
-      auto predecessors = GetPredecessors(id);
-      for (graaf::vertex_id_t pred_id : predecessors) {
-        auto& pred_vertex = inner_graph.get_vertex(pred_id);
-        auto edge = inner_graph.get_edge(pred_id, id);
-        pred_vertex.changes_ |= edge.GetDeps() & vertex.changes_;
+      auto successors = inner_graph.get_neighbors(id);
+      for (graaf::vertex_id_t succ_id : successors) {
+        auto& succ_vertex = inner_graph.get_vertex(succ_id);
+        auto edge = inner_graph.get_edge(id, succ_id);
+        succ_vertex.changes_ |= edge.GetDeps() & vertex.changes_;
       }
     }
   }

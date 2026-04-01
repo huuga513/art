@@ -519,25 +519,6 @@ class DependencyGraphPropagator {
   DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
   virtual ~DependencyGraphPropagator() = default;
   virtual void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
-  // Get all predecessors of a vertex (nodes that have edges pointing to this vertex)
-  std::vector<graaf::vertex_id_t> GetPredecessors(graaf::vertex_id_t vertex_id) {
-    std::vector<graaf::vertex_id_t> predecessors;
-    auto& inner_graph = graph_.graph_;
-
-    // Iterate all vertices to find those pointing to vertex_id
-    for (const auto& [other_id, _] : inner_graph.get_vertices()) {
-      if (other_id == vertex_id) {
-        continue;
-      }
-      auto neighbors = inner_graph.get_neighbors(other_id);
-      if (std::find(neighbors.begin(), neighbors.end(), vertex_id) != neighbors.end()) {
-        predecessors.push_back(other_id);
-      }
-    }
-
-    return predecessors;
-  }
-
   void PropagateChanges() {
     // Propagate changes through the dependency graph.
     // Edge Y → X means X depends on Y, so if Y changes, X is also affected.
@@ -915,26 +896,6 @@ class InlineDependencyExpander {
 
     LOG(INFO) << "Inline dependency expansion complete: added " << new_edges_added << " new edges";
     return new_edges_added;
-  }
-
-  // Get all predecessors of a vertex in a directed graph
-  static std::vector<graaf::vertex_id_t> GetPredecessors(
-      const graaf::graph<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::DIRECTED>& graph,
-      graaf::vertex_id_t vertex_id) {
-    std::vector<graaf::vertex_id_t> predecessors;
-
-    // Iterate all vertices to find those pointing to vertex_id
-    for (const auto& [other_id, _] : graph.get_vertices()) {
-      if (other_id == vertex_id) {
-        continue;
-      }
-      auto neighbors = graph.get_neighbors(other_id);
-      if (std::find(neighbors.begin(), neighbors.end(), vertex_id) != neighbors.end()) {
-        predecessors.push_back(other_id);
-      }
-    }
-
-    return predecessors;
   }
 
   const DependencyGraph& original_dep_graph_;

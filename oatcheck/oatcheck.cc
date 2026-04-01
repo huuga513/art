@@ -634,6 +634,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       // O(1) lookup using preprocessed map
       const art::DexFile* found_dex = nullptr;
       uint32_t found_class_def_idx = 0;
+      if (!bcp_graph_.HasClassAccessor(dex_sym_id)) continue;
       if (FindClassInNewDexFiles(descriptor, &found_dex, &found_class_def_idx)) {
         // Compare the class between old (from bcp_graph) and new (from new_dex_files)
         // Create ClassAccessor for old class from bcp_graph
@@ -1355,7 +1356,9 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
       // Run change detection and propagation
       BcpDependencyGraphPropagator propagator(&original_bcp_graph, updated_boot_dex_files);
+      LOG(INFO) << "Setting initial changes...";
       propagator.SetInitialChanges();
+      LOG(INFO) << "Propagating changes";
       propagator.PropagateChanges();
       LOG(INFO) << "BCP change propagation complete";
 

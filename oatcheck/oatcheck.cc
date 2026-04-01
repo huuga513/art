@@ -64,6 +64,7 @@ enum class DependencyType {
 struct DexSymId {
   uint32_t id;
   // |-- 8 bits: dex file index --|-- 8 bits: is method --|-- 16 bits: sym id --|
+  // sym id is class def id
   void SetDexFileIndex(uint32_t dex_file_index) {
     id = (id & 0x00FFFFFF) | (dex_file_index << 24);
   }
@@ -229,15 +230,25 @@ class BcpDependencyGraph : public DependencyGraph {
   }
 
   // Check if DexSymId is valid (within bounds)
+  // Returns false for external classes (dex_file_index = 0xFF)
   bool HasClassAccessor(const DexSymId& dex_sym_id) const {
     uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
     uint32_t class_def_index = dex_sym_id.GetSymId();
 
+    // External class marker (0xFF) is not valid for ClassAccessor
+    if (dex_file_index == 0xFF) {
+      return false;
+    }
     if (dex_file_index >= dex_files_->size()) {
       return false;
     }
     const art::DexFile* dex = dex_files_->at(dex_file_index).get();
     return class_def_index < dex->NumClassDefs();
+  }
+
+  // Check if DexSymId represents an external class (not in app dex files)
+  bool IsExternalClass(const DexSymId& dex_sym_id) const {
+    return dex_sym_id.GetDexFileIndex() == 0xFF;
   }
 
  private:
@@ -315,22 +326,67 @@ class BcpDependencyGraphBuilder {
     return true;
   }
 
-  bool AnalyzeDexClasses(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
-    // Build dependency edges based on class hierarchy.
+  // Step 1: Build descriptor -> DexSymId mapping for all classes in the dex file.
+  // Uses class_def_index (not type_idx) to correctly construct ClassAccessor.
+  bool BuildDescriptorMapping(const art::DexFile* dex, size_t dex_file_idx) {
     for (art::ClassAccessor accessor : dex->GetClasses()) {
-      // TODO: Handle interfaces
-      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
-      const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
-      const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
+      uint32_t class_def_index = accessor.GetClassDefIndex();
       const char* class_descriptor = accessor.GetDescriptor();
-      DexSymId superclass_dex_sym_id(dex_file_idx, false,
-                                    class_def.superclass_idx_.index_);
-      DexSymId class_dex_sym_id(dex_file_idx, false,
-                                 accessor.GetClassIdx().index_);
-      bcp_graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
+      DexSymId class_dex_sym_id(dex_file_idx, false, class_def_index);
+      descriptor_to_symid_.emplace(class_descriptor,class_dex_sym_id);
+      // Also add vertex for the class itself
       bcp_graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-      // Edge from superclass to subclass: subclass depends on superclass
-      bcp_graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
+    }
+    return true;
+  }
+
+  // Step 2: Build dependency edges using the descriptor mapping.
+  // For superclass: if found in mapping, use the DexSymId; otherwise create external DexSymId.
+  bool BuildDependencyEdges(const art::DexFile* dex, ATTRIBUTE_UNUSED size_t dex_file_idx) {
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
+      const char* class_descriptor = accessor.GetDescriptor();
+
+      // Get DexSymId for current class
+      auto it = descriptor_to_symid_.find(class_descriptor);
+      if (it == descriptor_to_symid_.end()) {
+        continue;  // Should not happen
+      }
+      DexSymId class_dex_sym_id = it->second;
+
+      // Handle superclass
+      if (class_def.superclass_idx_ != dex::TypeIndex::Invalid()) {
+        const char* superclass_descriptor = dex->GetTypeDescriptor(class_def.superclass_idx_);
+        DexSymId superclass_dex_sym_id(0,false,0);
+
+        // Look up superclass in descriptor mapping
+        auto super_it = descriptor_to_symid_.find(superclass_descriptor);
+        if (super_it != descriptor_to_symid_.end()) {
+          // Found in app dex files - use the DexSymId
+          superclass_dex_sym_id = super_it->second;
+        } else {
+          // Not found - create external class marker (dex_file_index = 0xFF)
+          superclass_dex_sym_id = DexSymId(static_cast<uint32_t>(0xFF), false, 0);
+        }
+
+        // Add vertex for superclass (if external, still need vertex for graph completeness)
+        bcp_graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
+        // Edge from superclass to subclass: subclass depends on superclass
+        bcp_graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
+      }
+    }
+    return true;
+  }
+
+  // Combined method for backward compatibility
+  bool AnalyzeDexClasses(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    // Step 1: Build descriptor -> DexSymId mapping
+    if (!BuildDescriptorMapping(dex, dex_file_idx)) {
+      return false;
+    }
+    // Step 2: Build dependency edges
+    if (!BuildDependencyEdges(dex, dex_file_idx)) {
+      return false;
     }
     return true;
   }
@@ -338,6 +394,10 @@ class BcpDependencyGraphBuilder {
   std::vector<const char*> jar_file_paths_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
   BcpDependencyGraph& bcp_graph_;
+
+  // Descriptor -> DexSymId mapping for O(1) lookup
+  // This maps class descriptors to their DexSymId (using class_def_index)
+  std::unordered_map<std::string, DexSymId> descriptor_to_symid_;
 };
 
 class DependencyGraphBuilder {
@@ -568,7 +628,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       for (uint32_t j = 0; j < dex->NumClassDefs(); ++j) {
         const dex::ClassDef& class_def = dex->GetClassDef(j);
         const char* class_descriptor = dex->GetClassDescriptor(class_def);
-        class_lookup_[class_descriptor] = {dex, j};
+        // Use GetIndexForClassDef to get the correct class_def_index, as j may not
+        // always be the class_def_index when iterating through class_defs in order.
+        class_lookup_[class_descriptor] = {dex, dex->GetIndexForClassDef(class_def)};
       }
     }
   }
@@ -636,7 +698,63 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     //  a. number of virtual methods changed
     //  b. if number of virtual methods stay the same, then any of new virtual method doesnt match corresponding old instance field
 
+    static int changed_class_count = 0;
+    const int kMaxPrintedChanges = 10;
+
     DependencyGraphNode& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
+
+    // Helper to convert field to string representation
+    auto field_to_string = [](const art::ClassAccessor& accessor,
+                               const art::ClassAccessor::Field& field) -> std::string {
+      const auto& field_id = accessor.GetDexFile().GetFieldId(field.GetIndex());
+      const char* name = accessor.GetDexFile().GetFieldName(field_id);
+      const char* type = accessor.GetDexFile().GetFieldTypeDescriptor(field_id);
+      return std::string(name) + ":" + std::string(type);
+    };
+
+    // Helper to convert method to string representation
+    auto method_to_string = [](const art::ClassAccessor& accessor,
+                                const art::ClassAccessor::Method& method) -> std::string {
+      const auto& method_id = accessor.GetDexFile().GetMethodId(method.GetIndex());
+      const char* name = accessor.GetDexFile().GetMethodName(method_id);
+      const Signature sig = accessor.GetDexFile().GetMethodSignature(method_id);
+      return std::string(name) + sig.ToString();
+    };
+
+    // Collect all fields and methods as strings for debugging
+    std::string old_static_fields_str, new_static_fields_str;
+    std::string old_instance_fields_str, new_instance_fields_str;
+    std::string old_virtual_methods_str, new_virtual_methods_str;
+
+    // Static fields
+    for (const auto& field : old_class_accessor.GetStaticFields()) {
+      if (!old_static_fields_str.empty()) old_static_fields_str += "; ";
+      old_static_fields_str += field_to_string(old_class_accessor, field);
+    }
+    for (const auto& field : new_class_accessor.GetStaticFields()) {
+      if (!new_static_fields_str.empty()) new_static_fields_str += "; ";
+      new_static_fields_str += field_to_string(new_class_accessor, field);
+    }
+
+    // Instance fields
+    for (const auto& field : old_class_accessor.GetInstanceFields()) {
+      if (!old_instance_fields_str.empty()) old_instance_fields_str += "; ";
+      old_instance_fields_str += field_to_string(old_class_accessor, field);
+    }
+    for (const auto& field : new_class_accessor.GetInstanceFields()) {
+      if (!new_instance_fields_str.empty()) new_instance_fields_str += "; ";
+      new_instance_fields_str += field_to_string(new_class_accessor, field);
+    }
+
+    // Virtual methods
+    for (const auto& method : old_class_accessor.GetVirtualMethods()) {
+      if (!old_virtual_methods_str.empty()) old_virtual_methods_str += "; ";
+      old_virtual_methods_str += method_to_string(old_class_accessor, method);
+    }
+    for (const auto& method : new_class_accessor.GetVirtualMethods()) {
+      if (!new_virtual_methods_str.empty()) new_virtual_methods_str += "; ";
+      new_virtual_methods_str += method_to_string(new_class_accessor, method);
+    }
 
     // Compare static field layout
     bool static_fields_changed = false;
@@ -720,6 +838,34 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     }
     if (vtable_changed) {
       vertex.changes_.set(static_cast<size_t>(DependencyType::kVirtualTableLayout));
+    }
+
+    // Print debug info for first kMaxPrintedChanges changed classes
+    if (static_fields_changed || instance_fields_changed || vtable_changed) {
+      if (changed_class_count < kMaxPrintedChanges) {
+        changed_class_count++;
+        const std::string& class_descriptor = vertex.GetDescriptor();
+        LOG(INFO) << "=== Class Change #" << changed_class_count << " ===";
+        LOG(INFO) << "Class: " << class_descriptor;
+
+        if (static_fields_changed) {
+          LOG(INFO) << "  [STATIC FIELDS CHANGED]";
+          LOG(INFO) << "    Old: " << old_static_fields_str;
+          LOG(INFO) << "    New: " << new_static_fields_str;
+        }
+
+        if (instance_fields_changed) {
+          LOG(INFO) << "  [INSTANCE FIELDS CHANGED]";
+          LOG(INFO) << "    Old: " << old_instance_fields_str;
+          LOG(INFO) << "    New: " << new_instance_fields_str;
+        }
+
+        if (vtable_changed) {
+          LOG(INFO) << "  [VIRTUAL METHODS CHANGED]";
+          LOG(INFO) << "    Old: " << old_virtual_methods_str;
+          LOG(INFO) << "    New: " << new_virtual_methods_str;
+        }
+      }
     }
   }
 

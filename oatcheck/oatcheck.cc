@@ -349,6 +349,7 @@ class BcpDependencyGraphBuilder {
       return it->second;
     }
     // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
+    LOG(INFO) << "External class:" << descriptor;
     DexSymId external_symid(static_cast<uint32_t>(0xFF), false, external_class_counter_);
     descriptor_to_symid_.emplace(descriptor, external_symid);
     external_class_counter_++;

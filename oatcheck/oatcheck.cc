@@ -303,7 +303,6 @@ class DependencyGraphBuilderBase {
       return it->second;
     }
     // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
-    LOG(INFO) << "External class:" << descriptor;
     DexSymId external_symid(static_cast<uint32_t>(0xFF), false, external_class_counter_);
     descriptor_to_symid_.emplace(descriptor, external_symid);
     external_class_counter_++;
@@ -498,8 +497,8 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
         std::string method_name(android::base::StringPrintf("d%zum%u", dex_file_idx,count));
         DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex());
         graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
-        if (count++ > 50000) // TODO: remove me
-          return true;
+        //if (count++ > 50000) // TODO: remove me
+          //return true;
         for (auto it = code.begin(); it != code.end(); it++) {
           DexInstructionPcPair inst = *it;
           if (IsInstructionInvoke(inst->Opcode())) {
@@ -1003,6 +1002,19 @@ class InlineDependencyExpander {
     // Step 1: Directly copy the original graph using copy constructor
     *expanded_graph = original_dep_graph_;
     size_t new_edges_added = 0;
+    size_t skipped_a_not_in_dep_graph = 0;
+    size_t skipped_b_not_in_dep_graph = 0;
+    size_t b_has_no_neighbors = 0;
+
+    // Build reverse adjacency map for fast predecessor lookup
+    // reverse_adj_[v] = list of vertices that have edges to v (i.e., predecessors of v)
+    std::unordered_map<graaf::vertex_id_t, std::vector<graaf::vertex_id_t>> reverse_adj;
+    for (const auto& [from_id, from_node] : original_dep_graph_.GetVertices()) {
+      auto neighbors = original_dep_graph_.graph_.get_neighbors(from_id);
+      for (graaf::vertex_id_t to_id : neighbors) {
+        reverse_adj[to_id].push_back(from_id);
+      }
+    }
 
     // Step 2: For each inline edge A → B (A inlines B)
     for (const auto& [vertex_a_id, vertex_a] : inline_graph_.GetVertices()) {
@@ -1015,6 +1027,7 @@ class InlineDependencyExpander {
 
       // Skip if vertex A doesn't exist in original dependency graph
       if (!original_dep_graph_.graph_.has_vertex(vertex_a_id)) {
+        skipped_a_not_in_dep_graph++;
         continue;
       }
 
@@ -1022,33 +1035,35 @@ class InlineDependencyExpander {
       for (graaf::vertex_id_t vertex_b_id : successors) {
         // Skip if vertex B doesn't exist in original dependency graph
         if (!original_dep_graph_.graph_.has_vertex(vertex_b_id)) {
+          skipped_b_not_in_dep_graph++;
           continue;
         }
 
-        // Get all outgoing edges from B in original dependency graph (B → C)
-        auto neighbors_b = original_dep_graph_.graph_.get_neighbors(vertex_b_id);
-
-        if (neighbors_b.empty()) {
+        // Get all predecessors of B using reverse adjacency map (C → B)
+        auto it = reverse_adj.find(vertex_b_id);
+        if (it == reverse_adj.end() || it->second.empty()) {
+          b_has_no_neighbors++;
           continue;
         }
 
-        // For each dependency edge B → C, add A → C to expanded graph
-        for (graaf::vertex_id_t vertex_c_id : neighbors_b) {
+        // For each predecessor C of B (C → B), add C → A to expanded graph
+        // This makes A depend on everything that B depends on.
+        for (graaf::vertex_id_t vertex_c_id : it->second) {
           // Get the dependency bits from original graph
-          const auto& edge_bc = original_dep_graph_.graph_.get_edge(vertex_b_id, vertex_c_id);
-          std::bitset<3> deps = edge_bc.GetDeps();
+          const auto& edge_c_b = original_dep_graph_.graph_.get_edge(vertex_c_id, vertex_b_id);
+          std::bitset<3> deps = edge_c_b.GetDeps();
 
           // Create DexSymId from vertex IDs
-          DexSymId from_dex_sym_id(vertex_a_id);
-          DexSymId to_dex_sym_id(vertex_c_id);
+          DexSymId from_dex_sym_id(vertex_c_id);
+          DexSymId to_dex_sym_id(vertex_a_id);
 
           // Add or update the edge in expanded graph
-          if (!expanded_graph->graph_.has_edge(vertex_a_id, vertex_c_id)) {
+          if (!expanded_graph->graph_.has_edge(vertex_c_id, vertex_a_id)) {
             expanded_graph->UpdateEdge(from_dex_sym_id, to_dex_sym_id, deps);
             new_edges_added++;
           } else {
             // Check if we need to merge dependency bits
-            auto& existing_edge = expanded_graph->graph_.get_edge(vertex_a_id, vertex_c_id);
+            auto& existing_edge = expanded_graph->graph_.get_edge(vertex_c_id, vertex_a_id);
             std::bitset<3> new_deps = existing_edge.GetDeps() | deps;
             if (new_deps != existing_edge.GetDeps()) {
               expanded_graph->UpdateEdge(from_dex_sym_id, to_dex_sym_id, new_deps);
@@ -1059,7 +1074,10 @@ class InlineDependencyExpander {
       }
     }
 
-    LOG(INFO) << "Inline dependency expansion complete: added " << new_edges_added << " new edges";
+    LOG(INFO) << "Inline dependency expansion: skipped A not in dep graph: " << skipped_a_not_in_dep_graph
+              << ", skipped B not in dep graph: " << skipped_b_not_in_dep_graph
+              << ", B has no neighbors: " << b_has_no_neighbors
+              << ", new edges added: " << new_edges_added;
     return new_edges_added;
   }
 

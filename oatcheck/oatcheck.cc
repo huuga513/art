@@ -424,13 +424,23 @@ class DependencyGraphBuilder {
       return false;
     }
     size_t i = 0;
+    // Step 1: Build descriptor -> DexSymId mapping for all dex files
+    for (const auto& dex : dex_files_) {
+      if (!BuildDescriptorMapping(dex.get(), i, error_msg)) {
+        LOG(ERROR) << "Failed to build descriptor mapping: " << *error_msg;
+        return false;
+      }
+      i++;
+    }
+    // Step 2: Analyze classes and methods using the mapping
+    i = 0;
     for (const auto& dex : dex_files_) {
       if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
         LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
         return false;
       }
-      if (!AnalyzeDexClasses(dex.get(), i, error_msg)) {
-        LOG(ERROR) << "Failed to analyze DEX classes: " << *error_msg;
+      if (!BuildDependencyEdges(dex.get(), i, error_msg)) {
+        LOG(ERROR) << "Failed to build dependency edges: " << *error_msg;
         return false;
       }
       i++;
@@ -465,22 +475,60 @@ class DependencyGraphBuilder {
     LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s):\n";
     return true;
   }
-  bool AnalyzeDexClasses(const art::DexFile* dex,size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
-    // Build dependency edges based on class hierarchy.
+  // Step 1: Build descriptor -> DexSymId mapping for all classes in the dex file.
+  // Uses class_def_index (not type_idx) to correctly construct DexSymId.
+  bool BuildDescriptorMapping(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
     for (art::ClassAccessor accessor : dex->GetClasses()) {
-      // TODO: Handle interfaces
-      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
-      const dex::TypeId& superclass_type_id = dex->GetTypeId(class_def.superclass_idx_);
-      const char* superclass_descriptor = dex->GetTypeDescriptor(superclass_type_id);
+      uint32_t class_def_index = accessor.GetClassDefIndex();
       const char* class_descriptor = accessor.GetDescriptor();
-      DexSymId superclass_dex_sym_id(dex_file_idx, false,
-                                    class_def.superclass_idx_.index_);
-      DexSymId class_dex_sym_id(dex_file_idx, false,
-                                 accessor.GetClassIdx().index_);
-      graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
+      DexSymId class_dex_sym_id(dex_file_idx, false, class_def_index);
+      descriptor_to_symid_.emplace(class_descriptor, class_dex_sym_id);
+      // Also add vertex for the class itself
       graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-      // Edge from superclass to subclass: subclass depends on superclass
-      graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
+    }
+    return true;
+  }
+
+  // Get or create DexSymId for a descriptor.
+  // If found in mapping, returns existing DexSymId.
+  // If not found, creates external DexSymId (dex_file_index = 0xFF, unique sym_id) and stores it.
+  DexSymId GetOrCreateDexSymId(const std::string& descriptor) {
+    auto it = descriptor_to_symid_.find(descriptor);
+    if (it != descriptor_to_symid_.end()) {
+      return it->second;
+    }
+    // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
+    LOG(INFO) << "External class:" << descriptor;
+    DexSymId external_symid(static_cast<uint32_t>(0xFF), false, external_class_counter_);
+    descriptor_to_symid_.emplace(descriptor, external_symid);
+    external_class_counter_++;
+    return external_symid;
+  }
+
+  // Step 2: Build dependency edges using the descriptor mapping.
+  // For superclass: if found in mapping, use the DexSymId; otherwise create external DexSymId.
+  bool BuildDependencyEdges(const art::DexFile* dex, ATTRIBUTE_UNUSED size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      const dex::ClassDef& class_def = dex->GetClassDef(accessor.GetClassDefIndex());
+      const char* class_descriptor = accessor.GetDescriptor();
+
+      // Get DexSymId for current class
+      auto it = descriptor_to_symid_.find(class_descriptor);
+      if (it == descriptor_to_symid_.end()) {
+        continue;  // Should not happen
+      }
+      DexSymId class_dex_sym_id = it->second;
+
+      // Handle superclass
+      if (class_def.superclass_idx_ != dex::TypeIndex::Invalid()) {
+        const char* superclass_descriptor = dex->GetTypeDescriptor(class_def.superclass_idx_);
+        DexSymId superclass_dex_sym_id = GetOrCreateDexSymId(superclass_descriptor);
+
+        // Add vertex for superclass (if external, still need vertex for graph completeness)
+        graph_.AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
+        // Edge from superclass to subclass: subclass depends on superclass
+        graph_.UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
+      }
     }
     return true;
   }
@@ -581,6 +629,13 @@ class DependencyGraphBuilder {
   const char* apk_file_path_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
   DependencyGraph& graph_;
+
+  // Descriptor -> DexSymId mapping for O(1) lookup
+  // This maps class descriptors to their DexSymId (using class_def_index)
+  std::unordered_map<std::string, DexSymId> descriptor_to_symid_;
+
+  // Counter for assigning unique sym_ids to external classes
+  uint32_t external_class_counter_ = 0;
 };
 
 class DependencyGraphPropagator {

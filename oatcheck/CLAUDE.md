@@ -70,6 +70,13 @@ Use oatcheck/oatcheck_host.py to run oatcheck:
 oatcheck/oatcheck_host.py [args of oatcheck]
 ```
 
+For example:
+
+a. test oatcheck with app
+```
+python3 oatcheck_host.py --apk=/ssd2/wyz/app_oats/com.tencent.mm/base.apk --oat=/ssd2/wyz/app_oats/com.tencent.mm/oat/base.odex 
+```
+
 ## Testing dex_loader module
 The implement of dex_loader is dex_loader.cc.
 

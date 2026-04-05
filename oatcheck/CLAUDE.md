@@ -76,15 +76,5 @@ a. test oatcheck with app
 ```
 python3 oatcheck_host.py --apk=/ssd2/wyz/app_oats/com.tencent.mm/base.apk --oat=/ssd2/wyz/app_oats/com.tencent.mm/oat/base.odex 
 ```
-
-## Testing dex_loader module
-The implement of dex_loader is dex_loader.cc.
-
-To test dex_loader module, just use the dex file /ssd2/wyz/classes.dex.
-
-Use oatcheck/test_dex_loader_host.py to run the test in text_dex_loader.cc:
-```bash
-oatcheck/test_dex_loader_host.py --dex=[dex file]
-```
 ## Dont remove include statements of include xxx-inl.h
 If mcp tells u some of xxx-inl.h never been used, dont care. It is a false positive.

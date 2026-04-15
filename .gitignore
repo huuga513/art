@@ -8,3 +8,5 @@ tools/boot.out
 compile_commands.json
 .vscode/
 .cache/
+scripts/AOSP_DIR
+scripts/DEVICE

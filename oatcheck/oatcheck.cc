@@ -16,6 +16,7 @@
 
 #include <bitset>
 #include <cstddef>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -61,6 +62,11 @@ enum class DependencyType {
   kVirtualTableLayout,
   kDependencyTypeCount
 };
+
+// Interface method change: independent change tracking for invoke-interface
+// Key: interface_descriptor, Value: set of "method_name:signature" that changed
+using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_set<std::string>>;
+
 struct DexSymId {
   uint32_t id;
   // |-- 8 bits: dex file index --|-- 8 bits: is method --|-- 16 bits: sym id --|
@@ -423,8 +429,10 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
 class DependencyGraphBuilder : public DependencyGraphBuilderBase {
  public:
-  DependencyGraphBuilder(const char* apk_file_path, DependencyGraph* graph)
-      : apk_file_path_(apk_file_path), graph_(*graph) {
+  DependencyGraphBuilder(const char* apk_file_path,
+                          DependencyGraph* graph,
+                          const InterfaceMethodChanges* interface_method_changes = nullptr)
+      : interface_method_changes_(interface_method_changes), apk_file_path_(apk_file_path), graph_(*graph) {
     // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in
     // OAT.
   }
@@ -460,6 +468,11 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
   }
 
  private:
+  // Pointer to interface method changes from BCP diff
+  const InterfaceMethodChanges* interface_method_changes_;
+  const char* apk_file_path_;
+  DependencyGraph& graph_;
+
   // Extract all classes*.dex from APK into `dex_files_`.
   bool ExtractDexFromApk(std::string* error_msg) {
     if (apk_file_path_ == nullptr) {
@@ -539,12 +552,42 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
                 }
                 break;
               }
-              case kDexInvokeInterface:
+              case kDexInvokeInterface: {
+                // Get interface type and method info
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* interface_descriptor = dex->GetStringData(name_id);
+
+                // Check if this is a boot classpath interface
+                if (!IsBootClasspathClass(interface_descriptor)) {
+                  break;
+                }
+
+                // Get method name and signature
+                const char* called_method_name = dex->GetMethodName(method_id);
+                Signature method_sig = dex->GetMethodSignature(method_id);
+                std::string method_key = std::string(called_method_name) + ":" + method_sig.ToString();
+
+                // Check if interface method has changed
+                if (interface_method_changes_ != nullptr) {
+                  auto interface_it = interface_method_changes_->find(interface_descriptor);
+                  if (interface_it != interface_method_changes_->end() &&
+                      interface_it->second.find(method_key) != interface_it->second.end()) {
+                  // Interface method changed - mark calling method as affected
+                  graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+                  auto& vertex = graph_.graph_.get_vertex(vertex_id);
+                  vertex.changes_.set();
+                }
+              }
                 break;
-              default:
+              }
+              default:{
                 LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
                              << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
                 break;
+              }
             }
           } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
             auto field_idx = inst->VRegC();
@@ -580,9 +623,6 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
     }
     return true;
   }
-
-  const char* apk_file_path_;
-  DependencyGraph& graph_;
 };
 
 class DependencyGraphPropagator {
@@ -646,8 +686,12 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     }
   }
 
+
+  // Getter for interface method changes (used by app dependency graph builder)
+  const InterfaceMethodChanges& GetInterfaceMethodChanges() const { return interface_method_changes_; }
   void SetInitialChanges() override {
     size_t initial_changed_class_counter = 0;
+    size_t interface_method_changes_counter = 0;
     // Iterate through all class nodes in BcpDependencyGraph
     for (const auto& [vertex_id, vertex] : bcp_graph_.GetVertices()) {
       // Create DexSymId from vertex_id
@@ -658,29 +702,97 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         continue;
       }
 
-      const std::string& descriptor = vertex.GetDescriptor();
+      const std::string& class_descriptor = vertex.GetDescriptor();
 
       // O(1) lookup using preprocessed map
       const art::DexFile* found_dex = nullptr;
       uint32_t found_class_def_idx = 0;
       if (!bcp_graph_.HasClassAccessor(dex_sym_id)) continue;
-      if (FindClassInNewDexFiles(descriptor, &found_dex, &found_class_def_idx)) {
+      if (FindClassInNewDexFiles(class_descriptor, &found_dex, &found_class_def_idx)) {
         // Compare the class between old (from bcp_graph) and new (from new_dex_files)
         // Create ClassAccessor for old class from bcp_graph
         art::ClassAccessor old_class_accessor = bcp_graph_.GetClassAccessor(dex_sym_id);
         // Create ClassAccessor for new class from updated_boot_dex_files
         art::ClassAccessor new_class_accessor(*found_dex, found_class_def_idx);
+
+        // Check if it's an interface by examining access flags
+        bool is_old_interface = (old_class_accessor.GetClassDef().access_flags_ & kAccInterface) != 0;
+        bool is_new_interface = (new_class_accessor.GetClassDef().access_flags_ & kAccInterface) != 0;
+
+        if (is_old_interface && is_new_interface) {
+          // Both are interfaces: check for method changes
+          auto changes = DetectInterfaceMethodChanges(old_class_accessor, new_class_accessor);
+          if (!changes.empty()) {
+            interface_method_changes_[class_descriptor] = std::move(changes);
+            interface_method_changes_counter += interface_method_changes_[class_descriptor].size();
+          }
+        } else if (is_old_interface && !is_new_interface) {
+          // Old interface is now not an interface - treat as deleted
+          interface_method_changes_[class_descriptor];  // Empty set marks interface as deleted
+        }
+
+        // Regular class changes
         bool changes_found = CompareAndMarkChanges(dex_sym_id, old_class_accessor, new_class_accessor);
         if (changes_found) {
           initial_changed_class_counter += 1;
         }
       } else {
         // Class not found in new DexFiles - mark as changed
-        // TODO: This might need special handling
+        // If it was an interface, mark all methods as changed
+        if (bcp_graph_.HasClassAccessor(dex_sym_id)) {
+          art::ClassAccessor old_class_accessor = bcp_graph_.GetClassAccessor(dex_sym_id);
+          if ((old_class_accessor.GetClassDef().access_flags_ & kAccInterface) != 0) {
+            // Interface deleted - all methods affected
+            std::unordered_set<std::string> all_methods;
+            for (const auto& method : old_class_accessor.GetMethods()) {
+              const auto& method_id = old_class_accessor.GetDexFile().GetMethodId(method.GetIndex());
+              const char* name = old_class_accessor.GetDexFile().GetMethodName(method_id);
+              Signature sig = old_class_accessor.GetDexFile().GetMethodSignature(method_id);
+              all_methods.insert(std::string(name) + ":" + sig.ToString());
+            }
+            interface_method_changes_[class_descriptor] = std::move(all_methods);
+          }
+        }
       }
     }
-    LOG(INFO) << "Found "<<initial_changed_class_counter<<"(s) initial changed classes";
+    LOG(INFO) << "Found " << initial_changed_class_counter << "(s) initial changed classes";
+    LOG(INFO) << "Found " << interface_method_changes_counter << "(s) interface method changes";
   }
+
+ private:
+  // Detect interface method changes: returns set of "method_name:signature" that changed
+  std::unordered_set<std::string> DetectInterfaceMethodChanges(
+      const art::ClassAccessor& old_interface,
+      const art::ClassAccessor& new_interface) {
+    std::unordered_set<std::string> changed_methods;
+
+    // Build map of old methods: method_name -> signature
+    std::map<std::string, std::string> old_methods;
+    for (const auto& method : old_interface.GetMethods()) {
+      const auto& method_id = old_interface.GetDexFile().GetMethodId(method.GetIndex());
+      const char* name = old_interface.GetDexFile().GetMethodName(method_id);
+      Signature sig = old_interface.GetDexFile().GetMethodSignature(method_id);
+      old_methods[std::string(name)] = sig.ToString();
+    }
+
+    // Compare with new methods
+    for (const auto& method : new_interface.GetMethods()) {
+      const auto& method_id = new_interface.GetDexFile().GetMethodId(method.GetIndex());
+      const char* name = new_interface.GetDexFile().GetMethodName(method_id);
+      Signature sig = new_interface.GetDexFile().GetMethodSignature(method_id);
+      std::string method_key = std::string(name) + ":" + sig.ToString();
+
+      auto it = old_methods.find(std::string(name));
+      if (it == old_methods.end() || it->second != sig.ToString()) {
+        // Method name or signature changed
+        changed_methods.insert(method_key);
+      }
+    }
+
+    return changed_methods;
+  }
+
+ public:
 
  private:
   // Find a class by descriptor using preprocessed lookup table (O(1))
@@ -892,6 +1004,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
   // Preprocessed lookup: descriptor -> (DexFile*, class_def_idx)
   std::unordered_map<std::string, std::pair<const art::DexFile*, uint32_t>> class_lookup_;
+
+  // Interface method changes: interface_descriptor -> set of changed method keys
+  InterfaceMethodChanges interface_method_changes_;
 };
 
 class OatFileAnalyzer {
@@ -1347,6 +1462,7 @@ Options:
 };
 
 std::unordered_set<std::string> changed_bcp_classes_descriptors;
+
 struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
   bool ExecuteWithoutRuntime() override {
     LOG(FATAL) << "This tool requires ART runtime.";
@@ -1358,10 +1474,122 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       LOG(INFO) << "Verbose mode enabled";
     }
 
-    // Handle --apk: extract DEX entry names
     std::string error_msg;
+    std::ostream* os = &std::cout;
+    if (args_->output_file_ != nullptr) {
+      LOG(WARNING) << "--output not implemented yet; using stdout";
+    }
+
+    *os << "Running OatCheck...\n";
+
+    // Process explicit --dex files
+    for (const char* dex : args_->dex_files_) {
+      *os << "Processing DEX: " << dex << "\n";
+      // TODO: Add real validation logic here.
+    }
+
+    if (args_->oat_file_)
+      *os << "OAT: " << args_->oat_file_ << "\n";
+    if (args_->origin_bcp_prefix_)
+      *os << "Original BCP prefix: " << args_->origin_bcp_prefix_ << "\n";
+    if (args_->updated_bcp_prefix_)
+      *os << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
+
+    // BCP change detection flow - run first to get interface method changes
+    const InterfaceMethodChanges* interface_method_changes_ptr = nullptr;
+
+    if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
+      LOG(INFO) << "Starting BCP change detection...";
+
+      // Collect original BCP JAR paths
+      std::vector<const char*> original_bcp_jars;
+      std::vector<std::string> original_paths_storage; // To keep strings alive
+
+      std::string origin_prefix = args_->origin_bcp_prefix_;
+      // Ensure prefix ends with /
+      if (!origin_prefix.empty() && origin_prefix.back() != '/') {
+        origin_prefix += '/';
+      }
+      for (const auto& jar_relative_path : kBootClasspathJars) {
+        // jar_relative_path starts with /, so we need to skip it when joining
+        std::string full_path = origin_prefix + jar_relative_path.substr(1);
+        original_paths_storage.push_back(full_path);
+        original_bcp_jars.push_back(original_paths_storage.back().c_str());
+      }
+
+      // Build original BCP dependency graph
+      BcpDependencyGraph original_bcp_graph;
+      BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, &original_bcp_graph);
+      if (!bcp_builder.BuildGraph(&error_msg)) {
+        LOG(ERROR) << "Failed to build original BCP dependency graph: " << error_msg;
+        return false;
+      }
+      LOG(INFO) << "Original BCP graph built: " << original_bcp_graph.Summary();
+
+      // Load updated BCP DEX files
+      std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
+      std::string updated_prefix = args_->updated_bcp_prefix_;
+      // Ensure prefix ends with /
+      if (!updated_prefix.empty() && updated_prefix.back() != '/') {
+        updated_prefix += '/';
+      }
+      for (const auto& jar_relative_path : kBootClasspathJars) {
+        // jar_relative_path starts with /, so we need to skip it when joining
+        std::string jar_path = updated_prefix + jar_relative_path.substr(1);
+        art::DexFileLoader loader(jar_path.c_str(), jar_path.c_str());
+        std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
+        if (!loader.Open(/*verify=*/true, /*verify_checksum=*/true, /*allow_no_dex_files=*/true, &error_msg, &jar_dex_files)) {
+          LOG(WARNING) << "Failed to load updated JAR " << jar_path << ": " << error_msg << ", skipping";
+          continue;
+        }
+        for (auto& dex : jar_dex_files) {
+          updated_boot_dex_files.push_back(std::move(dex));
+        }
+      }
+
+      if (updated_boot_dex_files.empty()) {
+        LOG(ERROR) << "No DEX files loaded from updated boot classes directory";
+        return false;
+      }
+      LOG(INFO) << "Loaded " << updated_boot_dex_files.size() << " updated BCP DEX files";
+
+      // Run change detection and propagation
+      BcpDependencyGraphPropagator bcp_propagator(&original_bcp_graph, updated_boot_dex_files);
+      LOG(INFO) << "Setting initial changes...";
+      bcp_propagator.SetInitialChanges();
+      LOG(INFO) << "Propagating changes";
+      bcp_propagator.PropagateChanges();
+      LOG(INFO) << "BCP change propagation complete";
+
+      // Get interface method changes for app dependency graph
+      interface_method_changes_ptr = &bcp_propagator.GetInterfaceMethodChanges();
+
+      // Collect and report results
+      size_t changed_classes = 0;
+      size_t changed_methods = 0;
+      for (const auto& [vertex_id, vertex] : original_bcp_graph.GetVertices()) {
+        if (vertex.IsChanged()) {
+          DexSymId sym_id(vertex_id);
+          if (sym_id.IsMethod()) {
+            changed_methods++;
+          } else {
+            changed_classes++;
+          }
+          if (args_->verbose_) {
+            LOG(INFO) << "Changed: " << vertex.GetDescriptor();
+          }
+        }
+      }
+
+      *os << "\nBCP Change Detection Results:\n";
+      *os << "  Changed classes: " << changed_classes << "\n";
+      *os << "  Changed methods: " << changed_methods << "\n";
+      *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
+    }
+
+    // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
-    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph);
+    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, interface_method_changes_ptr);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
@@ -1396,25 +1624,24 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       LOG(INFO) << "Dependency graph after expansion: " << graph.Summary();
     }
 
-    std::ostream* os = &std::cout;
     if (args_->output_file_ != nullptr) {
       LOG(WARNING) << "--output not implemented yet; using stdout";
     }
 
-    *os << "Running OatCheck...\n";
+    std::cout << "Running OatCheck...\n";
 
     // Process explicit --dex files
     for (const char* dex : args_->dex_files_) {
-      *os << "Processing DEX: " << dex << "\n";
+      std::cout << "Processing DEX: " << dex << "\n";
       // TODO: Add real validation logic here.
     }
 
     if (args_->oat_file_)
-      *os << "OAT: " << args_->oat_file_ << "\n";
+      std::cout << "OAT: " << args_->oat_file_ << "\n";
     if (args_->origin_bcp_prefix_)
-      *os << "Original BCP prefix: " << args_->origin_bcp_prefix_ << "\n";
+      std::cout << "Original BCP prefix: " << args_->origin_bcp_prefix_ << "\n";
     if (args_->updated_bcp_prefix_)
-      *os << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
+      std::cout << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
 
     // BCP change detection flow
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {

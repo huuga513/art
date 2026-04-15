@@ -688,7 +688,8 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
 
   // Getter for interface method changes (used by app dependency graph builder)
-  const InterfaceMethodChanges& GetInterfaceMethodChanges() const { return interface_method_changes_; }
+  // Move the ownership out since bcp_propagator will be destroyed after this
+  InterfaceMethodChanges GetInterfaceMethodChanges() { return std::move(interface_method_changes_); }
   void SetInitialChanges() override {
     size_t initial_changed_class_counter = 0;
     size_t interface_method_changes_counter = 0;
@@ -1496,7 +1497,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
 
     // BCP change detection flow - run first to get interface method changes
-    const InterfaceMethodChanges* interface_method_changes_ptr = nullptr;
+    // Use a local variable instead of pointer to avoid dangling reference
+    InterfaceMethodChanges interface_method_changes;
 
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
       LOG(INFO) << "Starting BCP change detection...";
@@ -1562,7 +1564,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       LOG(INFO) << "BCP change propagation complete";
 
       // Get interface method changes for app dependency graph
-      interface_method_changes_ptr = &bcp_propagator.GetInterfaceMethodChanges();
+      // Move ownership to avoid dangling pointer after bcp_propagator is destroyed
+      interface_method_changes = bcp_propagator.GetInterfaceMethodChanges();
 
       // Collect and report results
       size_t changed_classes = 0;
@@ -1589,7 +1592,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
-    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, interface_method_changes_ptr);
+    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, &interface_method_changes);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;

@@ -44,7 +44,6 @@ cc_defaults {
     host_supported: true,
     srcs: [
         "dex_loader.cc",
-        "test_dex_loader.cc",
     ],
     header_libs: [
         "art_cmdlineparser_headers",
@@ -105,52 +104,6 @@ art_cc_binary {
         "com.android.art",
         "com.android.art.debug",
         "test_broken_com.android.art",
-    ],
-}
-
-art_cc_binary {
-    name: "test_dex_loader",
-    defaults: ["test_dex_loader_defaults"],
-
-    target: {
-        android: {
-            shared_libs: [
-                "libart",
-                "libart-disassembler",
-                "libartbase",
-                "libbase",
-                "libdexfile",
-                "libprofile",
-                "liblog",
-                "libziparchive",
-            ],
-            static_libs: [
-                "libelffile",
-            ],
-        },
-        host: {
-            static_libs: ["libtest_dex_loader_static"],
-            stl: "c++_static",
-        },
-    },
-}
-
-// Static library for test_dex_loader (for host build)
-art_cc_library_static {
-    name: "libtest_dex_loader_static",
-    device_supported: false,
-    host_supported: true,
-    defaults: [
-        "libart-disassembler_static_defaults",
-        "libart_static_defaults",
-        "libartbase_static_defaults",
-        "libdexfile_static_defaults",
-        "libprofile_static_defaults",
-        "test_dex_loader_defaults",
-    ],
-    whole_static_libs: [
-        "libbase",
-        "liblog"
     ],
 }
 

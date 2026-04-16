@@ -540,21 +540,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
               case kDexInvokeSuper:
               case kDexInvokeDirect:
               case kDexInvokeStatic: {
-                // For invoke-super, invoke-direct, and invoke-static, if the target is
-                // from boot classpath, the call will always invalidate on system upgrade.
-                auto method_idx = inst->VRegB();
-                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* class_descriptor = dex->GetStringData(name_id);
-
-                if (IsBootClasspathClass(class_descriptor)) {
-                  // Mark the calling method as changed - all dependency bits set
-                  graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
-                  auto& vertex = graph_.graph_.get_vertex(vertex_id);
-                  vertex.changes_.set();
-                  g_class_layout_affected_methods++;
-                }
+                // There is no need to handle invoke super,invoke direct and invoke static.
                 break;
               }
               case kDexInvokeInterface: {

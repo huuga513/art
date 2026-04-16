@@ -67,6 +67,10 @@ enum class DependencyType {
 // Key: interface_descriptor, Value: set of "method_name:signature" that changed
 using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_set<std::string>>;
 
+// Global counters for statistics (will be removed later)
+static size_t g_interface_affected_methods = 0;
+static size_t g_class_layout_affected_methods = 0;
+
 struct DexSymId {
   uint32_t id;
   // |-- 8 bits: dex file index --|-- 8 bits: is method --|-- 16 bits: sym id --|
@@ -549,6 +553,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
                   graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
                   auto& vertex = graph_.graph_.get_vertex(vertex_id);
                   vertex.changes_.set();
+                  g_class_layout_affected_methods++;
                 }
                 break;
               }
@@ -579,6 +584,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
                   graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
                   auto& vertex = graph_.graph_.get_vertex(vertex_id);
                   vertex.changes_.set();
+                  g_interface_affected_methods++;
                 }
               }
                 break;
@@ -630,6 +636,37 @@ class DependencyGraphPropagator {
   DependencyGraphPropagator(DependencyGraph* graph) : graph_(*graph) {}
   virtual ~DependencyGraphPropagator() = default;
   virtual void SetInitialChanges();  // TODO: Set initial changes based on changed BCP classes.
+
+  // Set initial changes on app dependency graph based on changed BCP classes.
+  // Takes the changed class info from BCP diff and marks corresponding nodes in the graph.
+  void SetInitialChangesFromBcp(
+      const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info) {
+    size_t initial_changed_nodes = 0;
+
+    // Iterate through all vertices in the graph
+    for (const auto& [vertex_id, vertex] : graph_.GetVertices()) {
+      DexSymId dex_sym_id(vertex_id);
+
+      // Skip method nodes, only process class nodes
+      if (dex_sym_id.IsMethod()) {
+        continue;
+      }
+
+      const std::string& class_descriptor = vertex.GetDescriptor();
+
+      // Check if this class is in the changed BCP classes
+      auto it = changed_class_info.find(class_descriptor);
+      if (it != changed_class_info.end()) {
+        // Mark this node as changed with the appropriate dependency types
+        auto& graph_vertex = graph_.graph_.get_vertex(vertex_id);
+        graph_vertex.changes_ = it->second;
+        initial_changed_nodes++;
+      }
+    }
+
+    LOG(INFO) << "Set initial changes for " << initial_changed_nodes << " nodes from BCP diff";
+  }
+
   void PropagateChanges() {
     // Propagate changes through the dependency graph.
     // Edge Y → X means X depends on Y, so if Y changes, X is also affected.
@@ -662,6 +699,12 @@ class DependencyGraphPropagator {
  private:
   DependencyGraph& graph_;
 };
+
+// Empty base implementation - derived classes override SetInitialChanges
+// This is only used for BcpDependencyGraphPropagator which has its own implementation
+void DependencyGraphPropagator::SetInitialChanges() {
+  // Base class does nothing - BCP change detection is handled by BcpDependencyGraphPropagator
+}
 
 // BcpDependencyGraphPropagator compares new DexFiles against the BCP class descriptors
 // to determine which classes have changed.
@@ -736,6 +779,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         bool changes_found = CompareAndMarkChanges(dex_sym_id, old_class_accessor, new_class_accessor);
         if (changes_found) {
           initial_changed_class_counter += 1;
+          // Record the change info for app dependency graph
+          auto& changed_vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(dex_sym_id.id));
+          changed_class_info_[class_descriptor] = changed_vertex.changes_;
         }
       } else {
         // Class not found in new DexFiles - mark as changed
@@ -753,6 +799,8 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
             }
             interface_method_changes_[class_descriptor] = std::move(all_methods);
           }
+          // Record that this class was deleted (all change types)
+          changed_class_info_[class_descriptor].set();
         }
       }
     }
@@ -829,7 +877,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     //  b. if number of virtual methods stay the same, then any of new virtual method doesnt match corresponding old instance field
 
     static int changed_class_count = 0;
-    const int kMaxPrintedChanges = 10;
+    const int kMaxPrintedChanges = 0;
 
     DependencyGraphNode& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
 
@@ -1008,6 +1056,40 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
   // Interface method changes: interface_descriptor -> set of changed method keys
   InterfaceMethodChanges interface_method_changes_;
+
+  // Changed class info: class_descriptor -> bitset of change types
+  // This is used to propagate changes to the app dependency graph
+  std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info_;
+
+ public:
+  // Collect all changed classes after propagation.
+  // This includes both directly changed classes and indirectly affected classes
+  // (through dependency graph propagation).
+  void CollectChangedClassInfoAfterPropagation() {
+    // After SetInitialChanges() and PropagateChanges() have been called,
+    // collect ALL classes that have changes (not just directly changed ones).
+    size_t collected_classes = 0;
+    for (const auto& [vertex_id, vertex] : bcp_graph_.GetVertices()) {
+      DexSymId dex_sym_id(vertex_id);
+      // Skip method nodes, only process class nodes
+      if (dex_sym_id.IsMethod()) {
+        continue;
+      }
+      // Check if this class has any changes (directly or through propagation)
+      if (vertex.IsChanged()) {
+        const std::string& class_descriptor = vertex.GetDescriptor();
+        auto& graph_vertex = bcp_graph_.graph_.get_vertex(vertex_id);
+        changed_class_info_[class_descriptor] = graph_vertex.changes_;
+        collected_classes++;
+      }
+    }
+    LOG(INFO) << "Collected " << collected_classes << " changed classes after propagation";
+  }
+
+  // Getter for changed class info (used by app dependency graph propagator)
+  const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& GetChangedClassInfo() const {
+    return changed_class_info_;
+  }
 };
 
 class OatFileAnalyzer {
@@ -1500,6 +1582,9 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     // Use a local variable instead of pointer to avoid dangling reference
     InterfaceMethodChanges interface_method_changes;
 
+    // Changed class info for app dependency graph - populated when BCP diff is enabled
+    std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info;
+
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
       LOG(INFO) << "Starting BCP change detection...";
 
@@ -1563,9 +1648,15 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       bcp_propagator.PropagateChanges();
       LOG(INFO) << "BCP change propagation complete";
 
+      // Collect all changed classes after propagation (including indirect changes)
+      bcp_propagator.CollectChangedClassInfoAfterPropagation();
+
       // Get interface method changes for app dependency graph
       // Move ownership to avoid dangling pointer after bcp_propagator is destroyed
       interface_method_changes = bcp_propagator.GetInterfaceMethodChanges();
+
+      // Get changed class info for app dependency graph propagation
+      changed_class_info = bcp_propagator.GetChangedClassInfo();
 
       // Collect and report results
       size_t changed_classes = 0;
@@ -1625,6 +1716,37 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       size_t new_edges = expander.ExpandDependencies(&expanded_graph);
       graph = std::move(expanded_graph);
       LOG(INFO) << "Dependency graph after expansion: " << graph.Summary();
+
+      // Propagate changes through the expanded dependency graph to get AOT-invalidated methods
+      if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
+        LOG(INFO) << "Setting initial changes from BCP diff on expanded dependency graph...";
+        DependencyGraphPropagator propagator(&graph);
+        propagator.SetInitialChangesFromBcp(changed_class_info);
+
+        LOG(INFO) << "Propagating changes through expanded dependency graph...";
+        propagator.PropagateChanges();
+        LOG(INFO) << "Change propagation complete";
+
+        // Collect AOT-invalidated methods
+        size_t aot_invalidated_methods = 0;
+        for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
+          if (vertex.IsChanged()) {
+            DexSymId sym_id(vertex_id);
+            if (sym_id.IsMethod()) {
+              aot_invalidated_methods++;
+              if (args_->verbose_) {
+                LOG(INFO) << "AOT invalidated method: " << vertex.GetDescriptor();
+              }
+            }
+          }
+        }
+
+        *os << "\n=== AOT Invalidation Detection Results ===\n";
+        *os << "Total AOT-invalidated methods: " << aot_invalidated_methods << "\n";
+        // Statistics: interface vs class layout affected methods
+        *os << "  (Interface method changes: " << g_interface_affected_methods << ")\n";
+        *os << "  (Class layout changes: " << (aot_invalidated_methods - g_interface_affected_methods) << ")\n";
+      }
     }
 
     if (args_->output_file_ != nullptr) {
@@ -1645,93 +1767,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       std::cout << "Original BCP prefix: " << args_->origin_bcp_prefix_ << "\n";
     if (args_->updated_bcp_prefix_)
       std::cout << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
-
-    // BCP change detection flow
-    if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
-      LOG(INFO) << "Starting BCP change detection...";
-
-      // Collect original BCP JAR paths
-      std::vector<const char*> original_bcp_jars;
-      std::vector<std::string> original_paths_storage; // To keep strings alive
-
-      std::string origin_prefix = args_->origin_bcp_prefix_;
-      // Ensure prefix ends with /
-      if (!origin_prefix.empty() && origin_prefix.back() != '/') {
-        origin_prefix += '/';
-      }
-      for (const auto& jar_relative_path : kBootClasspathJars) {
-        // jar_relative_path starts with /, so we need to skip it when joining
-        std::string full_path = origin_prefix + jar_relative_path.substr(1);
-        original_paths_storage.push_back(full_path);
-        original_bcp_jars.push_back(original_paths_storage.back().c_str());
-      }
-
-      // Build original BCP dependency graph
-      BcpDependencyGraph original_bcp_graph;
-      BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, &original_bcp_graph);
-      if (!bcp_builder.BuildGraph(&error_msg)) {
-        LOG(ERROR) << "Failed to build original BCP dependency graph: " << error_msg;
-        return false;
-      }
-      LOG(INFO) << "Original BCP graph built: " << original_bcp_graph.Summary();
-
-      // Load updated BCP DEX files
-      std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
-      std::string updated_prefix = args_->updated_bcp_prefix_;
-      // Ensure prefix ends with /
-      if (!updated_prefix.empty() && updated_prefix.back() != '/') {
-        updated_prefix += '/';
-      }
-      for (const auto& jar_relative_path : kBootClasspathJars) {
-        // jar_relative_path starts with /, so we need to skip it when joining
-        std::string jar_path = updated_prefix + jar_relative_path.substr(1);
-        art::DexFileLoader loader(jar_path.c_str(), jar_path.c_str());
-        std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
-        if (!loader.Open(/*verify=*/true, /*verify_checksum=*/true, /*allow_no_dex_files=*/true, &error_msg, &jar_dex_files)) {
-          LOG(WARNING) << "Failed to load updated JAR " << jar_path << ": " << error_msg << ", skipping";
-          continue;
-        }
-        for (auto& dex : jar_dex_files) {
-          updated_boot_dex_files.push_back(std::move(dex));
-        }
-      }
-
-      if (updated_boot_dex_files.empty()) {
-        LOG(ERROR) << "No DEX files loaded from updated boot classes directory";
-        return false;
-      }
-      LOG(INFO) << "Loaded " << updated_boot_dex_files.size() << " updated BCP DEX files";
-
-      // Run change detection and propagation
-      BcpDependencyGraphPropagator propagator(&original_bcp_graph, updated_boot_dex_files);
-      LOG(INFO) << "Setting initial changes...";
-      propagator.SetInitialChanges();
-      LOG(INFO) << "Propagating changes";
-      propagator.PropagateChanges();
-      LOG(INFO) << "BCP change propagation complete";
-
-      // Collect and report results
-      size_t changed_classes = 0;
-      size_t changed_methods = 0;
-      for (const auto& [vertex_id, vertex] : original_bcp_graph.GetVertices()) {
-        if (vertex.IsChanged()) {
-          DexSymId sym_id(vertex_id);
-          if (sym_id.IsMethod()) {
-            changed_methods++;
-          } else {
-            changed_classes++;
-          }
-          if (args_->verbose_) {
-            LOG(INFO) << "Changed: " << vertex.GetDescriptor();
-          }
-        }
-      }
-
-      *os << "\nBCP Change Detection Results:\n";
-      *os << "  Changed classes: " << changed_classes << "\n";
-      *os << "  Changed methods: " << changed_methods << "\n";
-      *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
-    }
 
     *os << "Done.\n";
     return true;

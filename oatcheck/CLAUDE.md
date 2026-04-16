@@ -74,11 +74,7 @@ For example:
 
 a. test oatcheck with app
 ```
-python3 oatcheck_host.py --apk=/ssd2/wyz/app_oats/com.tencent.mm/base.apk --oat=/ssd2/wyz/app_oats/com.tencent.mm/oat/base.odex 
-```
-b. run only bcp diff
-```
-python3 oatcheck/oatcheck_host.py --origin-bcp-prefix=/ssd2/wyz/bcp_classes/15r3 --updated-bcp-prefix=/ssd2/wyz/bcp_classes/15r5
+python3 oatcheck_host.py --apk=/ssd2/wyz/app_oats/com.tencent.mm/base.apk --oat=/ssd2/wyz/app_oats/com.tencent.mm/oat/base.odex  --origin-bcp-prefix=/ssd2/wyz/bcp_classes/15r3 --updated-bcp-prefix=/ssd2/wyz/bcp_classes/15r5
 ```
 ## Dont remove include statements of include xxx-inl.h
 If mcp tells u some of xxx-inl.h never been used, dont care. It is a false positive.

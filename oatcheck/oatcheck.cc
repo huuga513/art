@@ -110,12 +110,25 @@ class DependencyGraphNode {
   const std::string& GetDescriptor() const { return descriptor_; }
   bool IsChanged() const { return changes_.any(); }
 
+  std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)> GetChanges() const {
+    return changes_;
+  }
+  void SetChanges(
+      const std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>& changes) {
+    changes_ = changes;
+  }
+  void SetChange() { changes_.set(); }
+  void SetChange(DependencyType type) {
+    changes_.set(static_cast<size_t>(type));
+  }
+  void MergeChanges(
+      const std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>& changes) {
+    changes_ |= changes;
+  }
+
  private:
   std::string descriptor_;
   std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)> changes_;
-  friend class DependencyGraphPropagator;
-  friend class DependencyGraphBuilder;
-  friend class BcpDependencyGraphPropagator;
 };
 
 // Caches all boot classpath class descriptors for fast lookup
@@ -196,7 +209,7 @@ public:
 };
 class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> {
  public:
-  DependencyGraph() {g_interface_affected_methods = 0;}
+  DependencyGraph() {}
   ~DependencyGraph() = default;
   DependencyGraph(DependencyGraph&&) = default;
   DependencyGraph& operator=(DependencyGraph&&) = default;
@@ -446,6 +459,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
         compiled_methods_(compiled_methods) {}
 
   bool BuildGraph(std::string* error_msg) override {
+    g_interface_affected_methods = 0;
     if (!ExtractDexFromApk(error_msg)) {
       return false;
     }
@@ -590,7 +604,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
                     graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
                     auto& vertex = graph_.graph_.get_vertex(vertex_id);
                     if (!vertex.IsChanged()) g_interface_affected_methods++;
-                    vertex.changes_.set();
+                    vertex.SetChange();
                   }
                 }
                 break;
@@ -668,7 +682,7 @@ class DependencyGraphPropagator {
         // This should be a class node, not a method node
         CHECK(!dex_sym_id.IsMethod()) << "SetInitialChangesFromBcp should not modify method nodes: "
                                         << class_descriptor;
-        graph_vertex.changes_ = it->second;
+        graph_vertex.SetChanges(it->second);
         initial_changed_nodes++;
       }
     }
@@ -700,7 +714,7 @@ class DependencyGraphPropagator {
       for (graaf::vertex_id_t succ_id : successors) {
         auto& succ_vertex = inner_graph.get_vertex(succ_id);
         auto edge = inner_graph.get_edge(id, succ_id);
-        succ_vertex.changes_ |= edge.GetDeps() & vertex.changes_;
+        succ_vertex.MergeChanges(edge.GetDeps() & vertex.GetChanges());
       }
     }
   }
@@ -790,7 +804,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
           initial_changed_class_counter += 1;
           // Record the change info for app dependency graph
           auto& changed_vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(dex_sym_id.id));
-          changed_class_info_[class_descriptor] = changed_vertex.changes_;
+          changed_class_info_[class_descriptor] = changed_vertex.GetChanges();
         }
       } else {
         // Class not found in new DexFiles - mark as changed
@@ -968,7 +982,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       }
     }
     if (static_fields_changed) {
-      vertex.changes_.set(static_cast<size_t>(DependencyType::kStaticFieldLayout));
+      vertex.SetChange(DependencyType::kStaticFieldLayout);
     }
 
     // Compare instance field layout
@@ -996,7 +1010,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       }
     }
     if (instance_fields_changed) {
-      vertex.changes_.set(static_cast<size_t>(DependencyType::kInstanceFieldLayout));
+      vertex.SetChange(DependencyType::kInstanceFieldLayout);
     }
 
     // Compare virtual table layout
@@ -1024,7 +1038,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       }
     }
     if (vtable_changed) {
-      vertex.changes_.set(static_cast<size_t>(DependencyType::kVirtualTableLayout));
+      vertex.SetChange(DependencyType::kVirtualTableLayout);
     }
 
     // Print debug info for first kMaxPrintedChanges changed classes
@@ -1088,7 +1102,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       if (vertex.IsChanged()) {
         const std::string& class_descriptor = vertex.GetDescriptor();
         auto& graph_vertex = bcp_graph_.graph_.get_vertex(vertex_id);
-        changed_class_info_[class_descriptor] = graph_vertex.changes_;
+        changed_class_info_[class_descriptor] = graph_vertex.GetChanges();
         collected_classes++;
       }
     }
@@ -1720,7 +1734,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         LOG(ERROR) << "No DEX files loaded from updated boot classes directory";
         return false;
       }
-      LOG(INFO) << "Loaded " << updated_boot_dex_files.size() << " updated BCP DEX files";
 
       // Run change detection and propagation
       BcpDependencyGraphPropagator bcp_propagator(&original_bcp_graph, updated_boot_dex_files);
@@ -1829,17 +1842,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       size_t new_edges = expander.ExpandDependencies(&expanded_graph);
       graph = std::move(expanded_graph);
       LOG(INFO) << "Dependency graph after expansion: " << graph.Summary();
-
-      // Debug: check if any vertex has changes after expansion
-      {
-        size_t vertices_with_changes = 0;
-        for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
-          if (vertex.IsChanged()) {
-            vertices_with_changes++;
-          }
-        }
-        LOG(INFO) << "Debug: vertices with changes after expansion: " << vertices_with_changes;
-      }
 
       // Propagate changes through the expanded dependency graph to get AOT-invalidated methods
       if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {

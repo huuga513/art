@@ -433,13 +433,17 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
 class DependencyGraphBuilder : public DependencyGraphBuilderBase {
  public:
+  // compiled_methods: set of (dex_file_idx, class_def_index, method_index) that have compiled code
+  using CompiledMethodSet = std::set<std::tuple<size_t, uint16_t, uint32_t>>;
+
   DependencyGraphBuilder(const char* apk_file_path,
                           DependencyGraph* graph,
-                          const InterfaceMethodChanges* interface_method_changes = nullptr)
-      : interface_method_changes_(interface_method_changes), apk_file_path_(apk_file_path), graph_(*graph) {
-    // TODO: There is no neccessity to analysis all methods in the APK, only compiled methods in
-    // OAT.
-  }
+                          const InterfaceMethodChanges* interface_method_changes = nullptr,
+                          const CompiledMethodSet* compiled_methods = nullptr)
+      : interface_method_changes_(interface_method_changes),
+        apk_file_path_(apk_file_path),
+        graph_(*graph),
+        compiled_methods_(compiled_methods) {}
 
   bool BuildGraph(std::string* error_msg) override {
     if (!ExtractDexFromApk(error_msg)) {
@@ -476,6 +480,8 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
   const InterfaceMethodChanges* interface_method_changes_;
   const char* apk_file_path_;
   DependencyGraph& graph_;
+  // Set of methods with compiled code: (dex_file_idx, class_def_index, method_index)
+  const CompiledMethodSet* compiled_methods_;
 
   // Extract all classes*.dex from APK into `dex_files_`.
   bool ExtractDexFromApk(std::string* error_msg) {
@@ -505,10 +511,24 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
 
   // Analyze method instructions and build method-level dependency edges.
   bool AnalyzeDexMethods(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    // Get compiled methods set from OatFileAnalyzer if available
+    const auto* compiled_methods = compiled_methods_;
+
     // Build dependency edges based on method instructions.
     uint32_t count = 0;
     for (art::ClassAccessor accessor : dex->GetClasses()) {
+      uint16_t class_def_index = accessor.GetClassDefIndex();
       for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+        // Check if method has compiled code in OAT file
+        if (compiled_methods != nullptr && !compiled_methods->empty()) {
+          auto it = compiled_methods->find({dex_file_idx, class_def_index, method.GetIndex()});
+          if (it == compiled_methods->end()) {
+            // Method not compiled, skip adding vertex
+            count++;
+            continue;
+          }
+        }
+
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         //std::string method_name(dex->PrettyMethod(method.GetIndex()));
         std::string method_name(android::base::StringPrintf("d%zum%u", dex_file_idx,count));
@@ -1097,6 +1117,77 @@ class OatFileAnalyzer {
   const art::OatFile* GetOatFile() const {
     return oat_file_.get();
   }
+
+  // Returns the set of methods that have compiled code in the OAT file.
+  // Key: (dex_file_idx, class_def_index, method_index)
+  const std::set<std::tuple<size_t, uint16_t, uint32_t>>& GetCompiledMethods() const {
+    return compiled_methods_;
+  }
+
+  // Precompute the set of methods that have OatMethod with compiled code
+  // Loads DexFiles from OatFile and validates order matches expected_dex_files (if provided)
+  bool PrecomputeCompiledMethods(const std::vector<std::unique_ptr<const art::DexFile>>* expected_dex_files = nullptr) {
+    if (oat_file_ == nullptr) {
+      return true;
+    }
+
+    // Load DexFiles from OAT
+    std::vector<std::unique_ptr<const art::DexFile>> oat_dex_files;
+    size_t oat_dex_file_count = oat_file_->GetOatDexFiles().size();
+    for (size_t i = 0; i < oat_dex_file_count; ++i) {
+      const art::OatDexFile* oat_dex_file = oat_file_->GetOatDexFiles()[i];
+      if (oat_dex_file == nullptr) {
+        continue;
+      }
+      std::string error_msg;
+      std::unique_ptr<const art::DexFile> dex_file = oat_dex_file->OpenDexFile(&error_msg);
+      if (dex_file == nullptr) {
+        LOG(ERROR) << "Failed to open DexFile from OAT: " << error_msg;
+        return false;
+      }
+
+      // Validate by SHA1 if expected_dex_files is provided
+      if (expected_dex_files != nullptr && i < expected_dex_files->size()) {
+        const art::DexFile* expected = expected_dex_files->at(i).get();
+        if (dex_file->GetSha1() != expected->GetSha1()) {
+          LOG(ERROR) << "DexFile SHA1 mismatch at index " << i
+                     << ": OAT has " << dex_file->GetSha1().ToString()
+                     << " but expected " << expected->GetSha1().ToString();
+          return false;
+        }
+      }
+
+      oat_dex_files.push_back(std::move(dex_file));
+    }
+
+    // Now iterate and find compiled methods
+    for (size_t i = 0; i < oat_dex_files.size(); ++i) {
+      const art::OatDexFile* oat_dex_file = oat_file_->GetOatDexFiles()[i];
+      if (oat_dex_file == nullptr) {
+        continue;
+      }
+
+      const art::DexFile* dex_file = oat_dex_files[i].get();
+      for (ClassAccessor accessor : dex_file->GetClasses()) {
+        const uint16_t class_def_index = accessor.GetClassDefIndex();
+        const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
+        uint32_t class_method_index = 0;
+
+        for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+          const OatFile::OatMethod oat_method = oat_class.GetOatMethod(class_method_index);
+          class_method_index++;
+          const OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
+          if (method_header != nullptr && method_header->GetCodeSize() > 0) {
+            // Method has compiled code - add to set
+            compiled_methods_.insert({i, class_def_index, method.GetIndex()});
+          }
+        }
+      }
+    }
+    LOG(INFO) << "Precomputed " << compiled_methods_.size() << " compiled methods from OAT file";
+    return true;
+  }
+
   // Returns a list of human-readable method descriptors for all methods
   // in the OAT file that have compiled native code (i.e., non-null CompiledMethod).
   // Format example: "java.lang.Object.toString:()Ljava/lang/String;"
@@ -1146,6 +1237,8 @@ class OatFileAnalyzer {
   const char* oat_file_path_;
   std::unique_ptr<art::OatFile> oat_file_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
+  // Precomputed set of methods with compiled code: (dex_file_idx, class_def_index, method_index)
+  std::set<std::tuple<size_t, uint16_t, uint32_t>> compiled_methods_;
 };
 class InlineCallGraphNode {
  public:
@@ -1667,25 +1760,56 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
     }
 
+    // Load OAT file first if provided (needed for filtering compiled methods)
+    std::unique_ptr<OatFileAnalyzer> oat_analyzer;
+    const DependencyGraphBuilder::CompiledMethodSet* compiled_methods = nullptr;
+    if (args_->oat_file_) {
+      oat_analyzer.reset(new OatFileAnalyzer(args_->oat_file_));
+      if (!oat_analyzer->LoadOatFile(&error_msg)) {
+        LOG(ERROR) << "Failed to load OAT file: " << error_msg;
+        return false;
+      }
+      // Precompute compiled methods after dex files are loaded in DependencyGraphBuilder
+    }
+
     // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
-    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, &interface_method_changes);
+    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, &interface_method_changes,
+                                          compiled_methods);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
+    }
+
+    // Now precompute compiled methods using the dex files from graph_builder
+    if (oat_analyzer != nullptr) {
+      if (!oat_analyzer->PrecomputeCompiledMethods(&graph_builder.GetDexFiles())) {
+        LOG(ERROR) << "Failed to precompute compiled methods";
+        return false;
+      }
+      compiled_methods = &oat_analyzer->GetCompiledMethods();
+      // Rebuild graph with compiled method filtering
+      DependencyGraph graph2;
+      DependencyGraphBuilder graph_builder2(args_->apk_file_, &graph2, &interface_method_changes,
+                                             compiled_methods);
+      if (!graph_builder2.BuildGraph(&error_msg)) {
+        LOG(ERROR) << error_msg;
+        return false;
+      }
+      graph = std::move(graph2);
     }
 
     // Build inline call graph if OAT file is provided
     InlineCallGraph inline_call_graph;
     if (args_->oat_file_) {
       LOG(INFO) << "Building inline call graph from OAT file...";
-      OatFileAnalyzer oat_analyzer(args_->oat_file_);
-      if (!oat_analyzer.LoadOatFile(&error_msg)) {
+      OatFileAnalyzer oat_analyzer2(args_->oat_file_);
+      if (!oat_analyzer2.LoadOatFile(&error_msg)) {
         LOG(ERROR) << "Failed to load OAT file: " << error_msg;
         return false;
       }
       InlineCallGraphBuilder inline_graph_builder(&inline_call_graph,
-                                                 oat_analyzer.GetOatFile(),
+                                                 oat_analyzer2.GetOatFile(),
                                                  graph_builder.GetDexFiles());
       if (!inline_graph_builder.BuildGraph(&error_msg)) {
         LOG(ERROR) << "Failed to build inline call graph: " << error_msg;

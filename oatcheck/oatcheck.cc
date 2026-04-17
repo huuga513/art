@@ -196,7 +196,7 @@ public:
 };
 class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge, graaf::graph_type::DIRECTED> {
  public:
-  DependencyGraph() = default;
+  DependencyGraph() {g_interface_affected_methods = 0;}
   ~DependencyGraph() = default;
   DependencyGraph(DependencyGraph&&) = default;
   DependencyGraph& operator=(DependencyGraph&&) = default;
@@ -586,13 +586,13 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
                   auto interface_it = interface_method_changes_->find(interface_descriptor);
                   if (interface_it != interface_method_changes_->end() &&
                       interface_it->second.find(method_key) != interface_it->second.end()) {
-                  // Interface method changed - mark calling method as affected
-                  graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
-                  auto& vertex = graph_.graph_.get_vertex(vertex_id);
-                  vertex.changes_.set();
-                  g_interface_affected_methods++;
+                    // Interface method changed - mark calling method as affected
+                    graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+                    auto& vertex = graph_.graph_.get_vertex(vertex_id);
+                    if (!vertex.IsChanged()) g_interface_affected_methods++;
+                    vertex.changes_.set();
+                  }
                 }
-              }
                 break;
               }
               default:{
@@ -665,6 +665,9 @@ class DependencyGraphPropagator {
       if (it != changed_class_info.end()) {
         // Mark this node as changed with the appropriate dependency types
         auto& graph_vertex = graph_.graph_.get_vertex(vertex_id);
+        // This should be a class node, not a method node
+        CHECK(!dex_sym_id.IsMethod()) << "SetInitialChangesFromBcp should not modify method nodes: "
+                                        << class_descriptor;
         graph_vertex.changes_ = it->second;
         initial_changed_nodes++;
       }
@@ -1316,15 +1319,15 @@ class InlineDependencyExpander {
           continue;
         }
 
-        // Get all predecessors of B using reverse adjacency map (C → B)
+        // Get all predecessors of B using reverse adjacency map (C → B means B depends on C)
         auto it = reverse_adj.find(vertex_b_id);
         if (it == reverse_adj.end() || it->second.empty()) {
           b_has_no_neighbors++;
           continue;
         }
 
-        // For each predecessor C of B (C → B), add C → A to expanded graph
-        // This makes A depend on everything that B depends on.
+        // For each predecessor C of B (C → B, B depends on C), add C → A to expanded graph
+        // This propagates: if A inlines B and B depends on C, then A also depends on C.
         for (graaf::vertex_id_t vertex_c_id : it->second) {
           // Get the dependency bits from original graph
           const auto& edge_c_b = original_dep_graph_.graph_.get_edge(vertex_c_id, vertex_b_id);
@@ -1826,6 +1829,17 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       size_t new_edges = expander.ExpandDependencies(&expanded_graph);
       graph = std::move(expanded_graph);
       LOG(INFO) << "Dependency graph after expansion: " << graph.Summary();
+
+      // Debug: check if any vertex has changes after expansion
+      {
+        size_t vertices_with_changes = 0;
+        for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
+          if (vertex.IsChanged()) {
+            vertices_with_changes++;
+          }
+        }
+        LOG(INFO) << "Debug: vertices with changes after expansion: " << vertices_with_changes;
+      }
 
       // Propagate changes through the expanded dependency graph to get AOT-invalidated methods
       if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {

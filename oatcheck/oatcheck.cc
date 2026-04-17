@@ -411,8 +411,6 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
         return false;
       }
 
-      LOG(INFO) << "Loaded " << jar_dex_files.size() << " DEX file(s) from " << jar_file_path;
-
       // Move loaded dex files to the global list
       for (auto& dex : jar_dex_files) {
         dex_files_.push_back(std::move(dex));

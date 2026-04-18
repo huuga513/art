@@ -1,42 +1,7 @@
 # Oatcheck Coding Guidelines
 
 ## Comments
-
-All comments in the oatcheck project **must be written in English**. This includes:
-- Source code comments (//, /* */)
-- Header comments
-- Documentation comments (/** */)
-- TODO comments
-- Git commit messages
-- Documentation files (README.md, etc.)
-
-## Rationale
-
-English is the universal language of software development and ensures:
-1. Consistency across the codebase
-2. Accessibility to international contributors
-3. Compatibility with existing Android Open Source Project (AOSP) conventions
-4. Clear communication for the maintainers and future developers
-
-## Examples
-
-Good (English):
-```cpp
-// Compute the shortest path using Dijkstra's algorithm
-template <typename Graph>
-std::vector<vertex_id_t> dijkstra_shortest_path(const Graph& graph, vertex_id_t start) {
-  // Implementation here
-}
-```
-
-Bad (Chinese):
-```cpp
-// 使用 Dijkstra 算法计算最短路径
-template <typename Graph>
-std::vector<vertex_id_t> dijkstra_shortest_path(const Graph& graph, vertex_id_t start) {
-  // 实现代码
-}
-```
+所有注释都应使用英文编写，包括代码注释，git提交信息
 
 ## Exceptions
 
@@ -77,5 +42,7 @@ a. test oatcheck with app
 # in dir art/...
 python3 oatcheck/oatcheck_host.py --apk=/ssd2/wyz/app_oats/com.tencent.mm/base.apk --oat=/ssd2/wyz/app_oats/com.tencent.mm/oat/base.odex  --origin-bcp-prefix=/ssd2/wyz/bcp_classes/15r3 --updated-bcp-prefix=/ssd2/wyz/bcp_classes/15r5
 ```
-## Dont remove include statements of include xxx-inl.h
+## 常见错误（重要）
+### Dont remove include statements of include xxx-inl.h
 If mcp tells u some of xxx-inl.h never been used, dont care. It is a false positive.
+### 不要重复已有的代码，尽可能复用现有代码

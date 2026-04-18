@@ -72,34 +72,58 @@ static size_t g_interface_affected_methods = 0;
 static size_t g_class_layout_affected_methods = 0;
 
 struct DexSymId {
-  uint32_t id;
-  // |-- 8 bits: dex file index --|-- 8 bits: is method --|-- 16 bits: sym id --|
-  // sym id is class def id
+  uint64_t id;
+  // 64-bit layout (high to low):
+  // | 24 bits unused | 8 bits dex_file_index | 16 bits class_def_id | 16 bits method_def_id |
+  // Bits 63-40: unused (reserved)
+  // Bits 39-32: dex file index (0-255), 0xFF indicates external class
+  // Bits 31-16: class_def_id (0-65535), class definition index in DEX file
+  // Bits 15-0: method_def_id (0-65535), method index in DEX file, 0xFFFF indicates this is a class (not a method)
+  //
+  // For class: method_def_id = 0xFFFF
+  // For method: class_def_id = class_def_index of defining class, method_def_id = method index
+  // For external class: dex_file_index = 0xFF
   void SetDexFileIndex(uint32_t dex_file_index) {
-    id = (id & 0x00FFFFFF) | (dex_file_index << 24);
+    id = (id & 0xFFFFFF00FFFFFFFFULL) | (static_cast<uint64_t>(dex_file_index & 0xFF) << 32);
   }
   uint32_t GetDexFileIndex() const {
-    return (id >> 24) & 0xFF;
+    return (id >> 32) & 0xFF;
   }
-  bool IsMethod() const {
-    return (id & 0x00FF0000) != 0;
+  void SetClassDefId(uint32_t class_def_id) {
+    id = (id & 0xFFFFFFFF0000FFFFULL) | (static_cast<uint64_t>(class_def_id & 0xFFFF) << 16);
   }
-  void SetSymId(uint32_t sym_id) {
-    id = (id & 0xFFFF0000) | (sym_id & 0x0000FFFF);
+  uint32_t GetClassDefId() const {
+    return (id >> 16) & 0xFFFF;
   }
-  uint32_t GetSymId() const {
-    return id & 0x0000FFFF;
+  void SetMethodDefId(uint32_t method_def_id) {
+    id = (id & 0xFFFFFFFFFFFF0000ULL) | (method_def_id & 0xFFFF);
   }
-  DexSymId(uint32_t dex_file_index, bool is_method, uint32_t sym_id) : id(0) {
+  uint32_t GetMethodDefId() const {
+    return id & 0xFFFF;
+  }
+  // Returns true if this is a class (method_def_id == 0xFFFF)
+  bool IsClass() const {
+    return (id & 0xFFFFULL) == 0xFFFF;
+  }
+  // Returns true if this represents an external class (dex_file_index == 0xFF)
+  bool IsExternalClass() const {
+    return GetDexFileIndex() == 0xFF;
+  }
+  // Constructor for class: method_def_id defaults to 0xFFFF
+  DexSymId(uint32_t dex_file_index, uint32_t class_def_id) : id(0) {
     SetDexFileIndex(dex_file_index);
-    if (is_method) {
-      id |= 0x00010000;
-    }
-    SetSymId(sym_id);
+    SetClassDefId(class_def_id);
+    SetMethodDefId(0xFFFF);
+  }
+  // Constructor for method: takes dex_file_index, class_def_id, and method_def_id
+  DexSymId(uint32_t dex_file_index, uint32_t class_def_id, uint32_t method_def_id) : id(0) {
+    SetDexFileIndex(dex_file_index);
+    SetClassDefId(class_def_id);
+    SetMethodDefId(method_def_id);
   }
   // Construct DexSymId from graaf vertex_id_t. Since vertex_id_t is directly
   // mapped to DexSymId.id, we can directly assign it.
-  explicit DexSymId(graaf::vertex_id_t vertex_id) : id(static_cast<uint32_t>(vertex_id)) {}
+  explicit DexSymId(graaf::vertex_id_t vertex_id) : id(static_cast<uint64_t>(vertex_id)) {}
 };
 
 class DependencyGraphNode {
@@ -246,7 +270,7 @@ class BcpDependencyGraph : public DependencyGraph {
   // DexSymId encodes: dex_file_index in high bits, class_def_index in low bits
   art::ClassAccessor GetClassAccessor(const DexSymId& dex_sym_id) const {
     uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
-    uint32_t class_def_index = dex_sym_id.GetSymId();
+    uint32_t class_def_index = dex_sym_id.GetClassDefId();
 
     const art::DexFile* dex = dex_files_->at(dex_file_index).get();
     return art::ClassAccessor(*dex, class_def_index);
@@ -256,7 +280,7 @@ class BcpDependencyGraph : public DependencyGraph {
   // Returns false for external classes (dex_file_index = 0xFF)
   bool HasClassAccessor(const DexSymId& dex_sym_id) const {
     uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
-    uint32_t class_def_index = dex_sym_id.GetSymId();
+    uint32_t class_def_index = dex_sym_id.GetClassDefId();
 
     // External class marker (0xFF) is not valid for ClassAccessor
     if (dex_file_index == 0xFF) {
@@ -309,7 +333,7 @@ class DependencyGraphBuilderBase {
     for (art::ClassAccessor accessor : dex->GetClasses()) {
       uint32_t class_def_index = accessor.GetClassDefIndex();
       const char* class_descriptor = accessor.GetDescriptor();
-      DexSymId class_dex_sym_id(dex_file_idx, false, class_def_index);
+      DexSymId class_dex_sym_id(dex_file_idx, class_def_index);
       descriptor_to_symid_.emplace(class_descriptor, class_dex_sym_id);
       // Also add vertex for the class itself
       graph->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
@@ -326,7 +350,7 @@ class DependencyGraphBuilderBase {
       return it->second;
     }
     // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
-    DexSymId external_symid(static_cast<uint32_t>(0xFF), false, external_class_counter_);
+    DexSymId external_symid(0xFF, external_class_counter_);
     descriptor_to_symid_.emplace(descriptor, external_symid);
     external_class_counter_++;
     return external_symid;
@@ -544,7 +568,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         //std::string method_name(dex->PrettyMethod(method.GetIndex()));
         std::string method_name(android::base::StringPrintf("d%zum%u", dex_file_idx,count));
-        DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex());
+        DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
         graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
         //if (count++ > 50000) // TODO: remove me
           //return true;
@@ -559,7 +583,8 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
                 const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
                 const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
                 const char* class_descriptor = dex->GetStringData(name_id);
-                DexSymId class_dex_sym_id(dex_file_idx, false, method_id.class_idx_.index_);
+                // Use descriptor mapping to get or create DexSymId
+                DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
                 graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
                 // Edge from class to method: method depends on class (for virtual table layout)
@@ -619,7 +644,8 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
-            DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
+            // Use descriptor mapping to get or create DexSymId
+            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
             graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
             // Edge from class to method: method depends on class (for instance field layout)
@@ -633,7 +659,8 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
-            DexSymId class_dex_sym_id(dex_file_idx, false, field_id.class_idx_.index_);
+            // Use descriptor mapping to get or create DexSymId
+            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
             graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
 
             // Edge from class to method: method depends on class (for static field layout)
@@ -666,7 +693,7 @@ class DependencyGraphPropagator {
       DexSymId dex_sym_id(vertex_id);
 
       // Skip method nodes, only process class nodes
-      if (dex_sym_id.IsMethod()) {
+      if (!dex_sym_id.IsClass()) {
         continue;
       }
 
@@ -678,7 +705,7 @@ class DependencyGraphPropagator {
         // Mark this node as changed with the appropriate dependency types
         auto& graph_vertex = graph_.graph_.get_vertex(vertex_id);
         // This should be a class node, not a method node
-        CHECK(!dex_sym_id.IsMethod()) << "SetInitialChangesFromBcp should not modify method nodes: "
+        CHECK(dex_sym_id.IsClass()) << "SetInitialChangesFromBcp should not modify method nodes: "
                                         << class_descriptor;
         graph_vertex.SetChanges(it->second);
         initial_changed_nodes++;
@@ -763,7 +790,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       DexSymId dex_sym_id(vertex_id);
 
       // Skip method nodes, only process class nodes
-      if (dex_sym_id.IsMethod()) {
+      if (!dex_sym_id.IsClass()) {
         continue;
       }
 
@@ -1093,7 +1120,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     for (const auto& [vertex_id, vertex] : bcp_graph_.GetVertices()) {
       DexSymId dex_sym_id(vertex_id);
       // Skip method nodes, only process class nodes
-      if (dex_sym_id.IsMethod()) {
+      if (!dex_sym_id.IsClass()) {
         continue;
       }
       // Check if this class has any changes (directly or through propagation)
@@ -1406,7 +1433,7 @@ class InlineCallGraphBuilder {
           uint32_t dex_method_idx = method.GetIndex();
           std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
           std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
-          DexSymId dex_sym_id(i, true, dex_method_idx);
+          DexSymId dex_sym_id(i, class_def_index, dex_method_idx);
           graph_.AddVertexIfAbsent(dex_sym_id, pretty_method, false);
         }
       }
@@ -1435,14 +1462,14 @@ class InlineCallGraphBuilder {
           uint32_t dex_method_idx = method.GetIndex();
           std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
           std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
-          DexSymId caller_dex_sym_id(i, true, dex_method_idx);
-          AnalyzeOatMethod(method_header, caller_dex_sym_id);
+          DexSymId caller_dex_sym_id(i, class_def_index, dex_method_idx);
+          AnalyzeOatMethod(method_header, class_def_index, caller_dex_sym_id);
         }
       }
     }
     return true;
   }
-  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id) {
+  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, uint16_t caller_class_def_idx, const DexSymId caller_dex_sym_id) {
     CodeInfo code_info(caller_header);
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
@@ -1451,7 +1478,7 @@ class InlineCallGraphBuilder {
         // Prefer MethodInfo regardless of whether ArtMethod* is available or not
         if (method_info.HasDexFileIndex()) {
           graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
-          DexSymId callee_dex_sym_id(method_info.GetDexFileIndex(), true, method_info.GetMethodIndex());
+          DexSymId callee_dex_sym_id(method_info.GetDexFileIndex(), caller_class_def_idx, method_info.GetMethodIndex());
           graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
 
           // Try to get method name
@@ -1757,7 +1784,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       for (const auto& [vertex_id, vertex] : original_bcp_graph.GetVertices()) {
         if (vertex.IsChanged()) {
           DexSymId sym_id(vertex_id);
-          if (sym_id.IsMethod()) {
+          if (!sym_id.IsClass()) {
             changed_methods++;
           } else {
             changed_classes++;
@@ -1856,7 +1883,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
           if (vertex.IsChanged()) {
             DexSymId sym_id(vertex_id);
-            if (sym_id.IsMethod()) {
+            if (!sym_id.IsClass()) {
               aot_invalidated_methods++;
               if (args_->verbose_) {
                 LOG(INFO) << "AOT invalidated method: " << vertex.GetDescriptor();

@@ -2107,8 +2107,10 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
               }
             }
 
-            // Generate output file name: original.oat -> original.oat.fixed
-            std::string output_path = std::string(args_->oat_file_) + ".fixed";
+            // Generate output file name: original.oat -> original.oatfixed
+            // Note: Using .oatfixed instead of .oat.fixed so that GetVdexFilename
+            // correctly derives the vdex filename as original.vdex instead of original.oat.vdex
+            std::string output_path = std::string(args_->oat_file_) + "fixed";
 
             if (patcher.SaveToFile(output_path, &fix_error_msg)) {
               *os << "\n=== Fixed OAT File ===\n";

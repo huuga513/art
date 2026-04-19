@@ -126,6 +126,35 @@ art_cc_library_static {
     ],
 }
 
+cc_defaults {
+    name: "test_fix_validation_srcs",
+    defaults: [ "art_defaults" ],
+    host_supported: true,
+    srcs: [
+        "dex_loader.cc",
+        "test_fix_validation.cc",
+    ],
+    header_libs: [
+        "art_cmdlineparser_headers",
+    ],
+    local_include_dirs:[
+        "include"
+    ],
+}
+
+art_cc_binary {
+    name: "test_fix_validation",
+    defaults: ["test_fix_validation_srcs"],
+    host_supported: true,
+    device_supported: false,
+    target: {
+        host: {
+            static_libs: ["liboatcheck_static"],
+            stl: "c++_static",
+        },
+    },
+}
+
 art_cc_binary {
     name: "oatcheckd",
     defaults: [

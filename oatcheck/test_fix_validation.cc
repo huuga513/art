@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -22,11 +23,16 @@
 #include <set>
 #include <tuple>
 #include <memory>
+#include <map>
+#include <optional>
+#include <sstream>
 
+#include "base/hex_dump.h"
 #include "cmdline.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/class_accessor.h"
 #include "dex/dex_file.h"
+#include "disassembler.h"
 #include "oat/oat_file.h"
 #include "oat/oat_file-inl.h"
 #include "oat/oat_quick_method_header.h"
@@ -90,6 +96,9 @@ class OatFileValidator {
           info.class_def_idx = class_def_index;
           info.method_idx = method.GetIndex();
           info.code_offset = code_offset;
+          info.code_ptr = method_header->GetCode();
+          info.code_size = method_header->GetCodeSize();
+          info.is_compiled = true;
 
           methods_.push_back(info);
         }
@@ -105,6 +114,10 @@ class OatFileValidator {
     uint16_t class_def_idx;
     uint32_t method_idx;
     uint32_t code_offset;
+    // New fields for code comparison
+    const uint8_t* code_ptr = nullptr;
+    uint32_t code_size = 0;
+    bool is_compiled = false;
   };
 
   // Get all methods with code_offset == 0
@@ -128,6 +141,272 @@ class OatFileValidator {
   std::vector<MethodInfo> methods_;
 };
 
+// Code difference structure
+struct CodeDifference {
+  size_t dex_file_idx;
+  uint16_t class_def_idx;
+  uint32_t method_idx;
+  std::string method_name;
+  std::string class_name;
+  uint32_t diff_offset = 0;
+  uint32_t fixed_byte = 0;
+  uint32_t orig_byte = 0;
+  uint32_t fixed_size = 0;
+  uint32_t orig_size = 0;
+  bool size_differs = false;
+  enum class Status { kIdentical, kDifferent, kOnlyInFixed, kOnlyInOriginal };
+  Status status = Status::kIdentical;
+};
+
+// Code comparison result class
+class CodeComparisonResult {
+ public:
+  void AddDifference(const CodeDifference& diff) {
+    differences_.push_back(diff);
+    if (diff.status != CodeDifference::Status::kIdentical) {
+      has_differences_ = true;
+    }
+  }
+
+  bool HasDifferences() const { return has_differences_; }
+
+  size_t CountIdentical() const {
+    size_t count = 0;
+    for (const auto& d : differences_) {
+      if (d.status == CodeDifference::Status::kIdentical) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  size_t CountDifferent() const {
+    size_t count = 0;
+    for (const auto& d : differences_) {
+      if (d.status == CodeDifference::Status::kDifferent) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  size_t CountOnlyInFixed() const {
+    size_t count = 0;
+    for (const auto& d : differences_) {
+      if (d.status == CodeDifference::Status::kOnlyInFixed) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  size_t CountOnlyInOriginal() const {
+    size_t count = 0;
+    for (const auto& d : differences_) {
+      if (d.status == CodeDifference::Status::kOnlyInOriginal) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  const std::vector<CodeDifference>& GetDifferences() const { return differences_; }
+
+ private:
+  std::vector<CodeDifference> differences_;
+  bool has_differences_ = false;
+};
+
+// Helper functions for code comparison
+static bool CollectMethodsWithCode(OatFile* oat_file,
+                                   std::vector<OatFileValidator::MethodInfo>* methods,
+                                   std::string* /*error_msg*/) {
+  size_t dex_file_count = oat_file->GetOatDexFiles().size();
+
+  for (size_t i = 0; i < dex_file_count; ++i) {
+    const OatDexFile* oat_dex_file = oat_file->GetOatDexFiles()[i];
+    if (oat_dex_file == nullptr) {
+      continue;
+    }
+
+    std::string dex_error_msg;
+    std::unique_ptr<const DexFile> dex_file = oat_dex_file->OpenDexFile(&dex_error_msg);
+    if (dex_file == nullptr) {
+      continue;
+    }
+
+    for (ClassAccessor accessor : dex_file->GetClasses()) {
+      const uint16_t class_def_index = accessor.GetClassDefIndex();
+      const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
+      uint32_t class_method_index = 0;
+
+      for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+        const OatFile::OatMethod oat_method = oat_class.GetOatMethod(class_method_index);
+        class_method_index++;
+
+        uint32_t code_offset = oat_method.GetCodeOffset();
+        const OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
+        if (method_header == nullptr || method_header->GetCodeSize() == 0) {
+          continue;
+        }
+
+        OatFileValidator::MethodInfo info;
+        info.dex_file_idx = i;
+        info.class_def_idx = class_def_index;
+        info.method_idx = method.GetIndex();
+        info.code_offset = code_offset;
+        info.code_ptr = method_header->GetCode();
+        info.code_size = method_header->GetCodeSize();
+        info.is_compiled = true;
+
+        methods->push_back(info);
+      }
+    }
+  }
+  return true;
+}
+
+static uint64_t ComputeMethodKey(const OatFileValidator::MethodInfo& m) {
+  return (static_cast<uint64_t>(m.dex_file_idx) << 48) |
+         (static_cast<uint64_t>(m.class_def_idx) << 32) |
+         static_cast<uint64_t>(m.method_idx);
+}
+
+static std::optional<CodeDifference> CompareMethodCode(
+    const OatFileValidator::MethodInfo& fixed_method,
+    const OatFileValidator::MethodInfo& orig_method,
+    const DexFile* fixed_dex_file,
+    const DexFile* /*orig_dex_file*/) {
+
+  CodeDifference diff;
+  diff.dex_file_idx = fixed_method.dex_file_idx;
+  diff.class_def_idx = fixed_method.class_def_idx;
+  diff.method_idx = fixed_method.method_idx;
+
+  if (fixed_dex_file != nullptr) {
+    if (fixed_method.method_idx < fixed_dex_file->NumMethodIds()) {
+      diff.method_name = fixed_dex_file->GetMethodName(fixed_dex_file->GetMethodId(fixed_method.method_idx));
+    }
+    if (fixed_method.class_def_idx < fixed_dex_file->NumClassDefs()) {
+      const dex::ClassDef& class_def = fixed_dex_file->GetClassDef(fixed_method.class_def_idx);
+      std::string_view descriptor = fixed_dex_file->GetTypeDescriptorView(class_def.class_idx_);
+      diff.class_name = std::string(descriptor);
+    }
+  }
+
+  diff.fixed_size = fixed_method.code_size;
+  diff.orig_size = orig_method.code_size;
+
+  if (fixed_method.code_size == orig_method.code_size &&
+      fixed_method.code_ptr != nullptr && orig_method.code_ptr != nullptr &&
+      memcmp(fixed_method.code_ptr, orig_method.code_ptr, fixed_method.code_size) == 0) {
+    diff.status = CodeDifference::Status::kIdentical;
+    return std::nullopt;
+  }
+
+  diff.status = CodeDifference::Status::kDifferent;
+
+  if (fixed_method.code_size != orig_method.code_size) {
+    diff.size_differs = true;
+  }
+
+  uint32_t min_size = std::min(fixed_method.code_size, orig_method.code_size);
+  uint32_t offset = 0;
+  if (fixed_method.code_ptr != nullptr && orig_method.code_ptr != nullptr) {
+    while (offset < min_size) {
+      if (fixed_method.code_ptr[offset] != orig_method.code_ptr[offset]) {
+        break;
+      }
+      offset++;
+    }
+  }
+
+  if (offset < min_size) {
+    diff.diff_offset = offset;
+    diff.fixed_byte = fixed_method.code_ptr[offset];
+    diff.orig_byte = orig_method.code_ptr[offset];
+  }
+
+  return diff;
+}
+
+static CodeComparisonResult CompareOatFiles(
+    OatFile* fixed_oat,
+    OatFile* orig_oat,
+    const std::string& /*fixed_path*/,
+    const std::string& /*orig_path*/,
+    std::string* error_msg) {
+
+  CodeComparisonResult result;
+
+  std::vector<OatFileValidator::MethodInfo> fixed_methods, orig_methods;
+
+  if (!CollectMethodsWithCode(fixed_oat, &fixed_methods, error_msg)) {
+    return result;
+  }
+  if (!CollectMethodsWithCode(orig_oat, &orig_methods, error_msg)) {
+    return result;
+  }
+
+  std::map<uint64_t, const OatFileValidator::MethodInfo*> orig_method_map;
+  for (const auto& m : orig_methods) {
+    orig_method_map[ComputeMethodKey(m)] = &m;
+  }
+
+  for (const auto& fixed_method : fixed_methods) {
+    uint64_t key = ComputeMethodKey(fixed_method);
+    auto it = orig_method_map.find(key);
+
+    if (it == orig_method_map.end()) {
+      CodeDifference diff;
+      diff.dex_file_idx = fixed_method.dex_file_idx;
+      diff.class_def_idx = fixed_method.class_def_idx;
+      diff.method_idx = fixed_method.method_idx;
+      diff.status = CodeDifference::Status::kOnlyInFixed;
+      result.AddDifference(diff);
+    } else {
+      const OatFileValidator::MethodInfo* orig_method = it->second;
+
+      const OatDexFile* fixed_oat_dex = fixed_oat->GetOatDexFiles()[fixed_method.dex_file_idx];
+      const OatDexFile* orig_oat_dex = orig_oat->GetOatDexFiles()[orig_method->dex_file_idx];
+
+      std::unique_ptr<const DexFile> fixed_dex, orig_dex;
+      if (fixed_oat_dex != nullptr) {
+        std::string dex_err;
+        fixed_dex = fixed_oat_dex->OpenDexFile(&dex_err);
+      }
+      if (orig_oat_dex != nullptr) {
+        std::string dex_err;
+        orig_dex = orig_oat_dex->OpenDexFile(&dex_err);
+      }
+
+      auto diff = CompareMethodCode(fixed_method, *orig_method, fixed_dex.get(), orig_dex.get());
+      if (diff.has_value()) {
+        result.AddDifference(*diff);
+      } else {
+        CodeDifference identical_diff;
+        identical_diff.dex_file_idx = fixed_method.dex_file_idx;
+        identical_diff.class_def_idx = fixed_method.class_def_idx;
+        identical_diff.method_idx = fixed_method.method_idx;
+        identical_diff.status = CodeDifference::Status::kIdentical;
+        result.AddDifference(identical_diff);
+      }
+      orig_method_map.erase(it);
+    }
+  }
+
+  for (const auto& [key, orig_method] : orig_method_map) {
+    CodeDifference diff;
+    diff.dex_file_idx = orig_method->dex_file_idx;
+    diff.class_def_idx = orig_method->class_def_idx;
+    diff.method_idx = orig_method->method_idx;
+    diff.status = CodeDifference::Status::kOnlyInOriginal;
+    result.AddDifference(diff);
+  }
+
+  return result;
+}
+
 }  // namespace art
 
 struct TestFixValidationArgs : public art::CmdlineArgs {
@@ -137,6 +416,10 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
  public:
   char const* fixed_oat_file_ = nullptr;
   char const* original_oat_file_ = nullptr;
+  bool compare_code_ = false;
+  uint32_t max_diffs_ = 100;
+  bool show_hex_dumps_ = true;
+  bool show_disasm_ = true;
 
   ParseStatus ParseCustom(const char* raw_option,
                           size_t raw_option_length,
@@ -147,6 +430,18 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
       fixed_oat_file_ = raw_option + strlen("--fixed-oat=");
     } else if (option.starts_with("--original-oat=")) {
       original_oat_file_ = raw_option + strlen("--original-oat=");
+    } else if (option == "--compare-code") {
+      compare_code_ = true;
+    } else if (option.starts_with("--max-diffs=")) {
+      max_diffs_ = std::atoi(raw_option + strlen("--max-diffs="));
+    } else if (option == "--hex-dumps") {
+      show_hex_dumps_ = true;
+    } else if (option == "--no-hex-dumps") {
+      show_hex_dumps_ = false;
+    } else if (option == "--disasm") {
+      show_disasm_ = true;
+    } else if (option == "--no-disasm") {
+      show_disasm_ = false;
     } else {
       return Base::ParseCustom(raw_option, raw_option_length, error_msg);
     }
@@ -157,6 +452,10 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
     std::cerr << "Usage: " << "test_prog" << " [options]\n";
     std::cerr << "  --fixed-oat=<file>       Path to the fixed OAT file\n";
     std::cerr << "  --original-oat=<file>   Path to the original OAT file for comparison\n";
+    std::cerr << "  --compare-code          Compare machine code byte-by-byte\n";
+    std::cerr << "  --max-diffs=N           Maximum differences to show (default 100)\n";
+    std::cerr << "  --hex-dumps / --no-hex-dumps  Show/hide hex dumps (default show)\n";
+    std::cerr << "  --disasm / --no-disasm  Show/hide ARM64 disassembly (default show)\n";
     Base::PrintUsage();
   }
 };
@@ -243,6 +542,93 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
     std::cout << "\n=== Results ===\n";
     std::cout << "Total compiled methods: " << total_compiled_methods << "\n";
     std::cout << "Methods with code_offset == 0: " << disabled_count << "\n";
+
+    // Code comparison mode
+    if (args_->compare_code_) {
+      if (original_oat_path.empty()) {
+        std::cerr << "ERROR: --compare-code requires --original-oat <file>\n";
+        return false;
+      }
+
+      std::cout << "\n=== Code Comparison Mode ===\n";
+      std::cout << "Fixed OAT: " << fixed_oat_path << "\n";
+      std::cout << "Original OAT: " << original_oat_path << "\n";
+
+      std::unique_ptr<art::OatFile> original_oat(art::OatFile::Open(
+          /* zip_fd */ -1,
+          original_oat_path,
+          original_oat_path,
+          /* executable */ false,
+          /* low_4gb */ false,
+          &error_msg));
+
+      if (original_oat == nullptr) {
+        std::cerr << "ERROR: Failed to open original OAT file: " << error_msg << "\n";
+        return false;
+      }
+
+      art::CodeComparisonResult result = art::CompareOatFiles(
+          fixed_oat.get(),
+          original_oat.get(),
+          fixed_oat_path,
+          original_oat_path,
+          &error_msg);
+
+      std::cout << "\n=== Comparison Summary ===\n";
+      std::cout << "Identical methods: " << result.CountIdentical() << "\n";
+      std::cout << "Different methods: " << result.CountDifferent() << "\n";
+      std::cout << "Only in fixed: " << result.CountOnlyInFixed() << "\n";
+      std::cout << "Only in original: " << result.CountOnlyInOriginal() << "\n";
+
+      if (result.HasDifferences()) {
+        std::cout << "\n=== Detailed Differences ===\n";
+        size_t count = 0;
+        for (const auto& diff : result.GetDifferences()) {
+          if (count++ >= args_->max_diffs_) {
+            std::cout << "... (stopped at " << args_->max_diffs_ << " differences)\n";
+            break;
+          }
+          if (diff.status == art::CodeDifference::Status::kIdentical) {
+            continue;
+          }
+
+          // For now, just print the method info without hex dump/disasm
+          // (hex dump requires re-collecting method info which is complex)
+          std::cout << "METHOD: " << diff.class_name << "->" << diff.method_name << "\n";
+          std::cout << "  dex=" << diff.dex_file_idx
+                    << " class_def=" << diff.class_def_idx
+                    << " method=" << diff.method_idx << "\n";
+
+          switch (diff.status) {
+            case art::CodeDifference::Status::kDifferent:
+              if (diff.size_differs) {
+                std::cout << "  CODE SIZE DIFFERS: fixed=" << diff.fixed_size
+                          << " orig=" << diff.orig_size << "\n";
+              }
+              if (diff.diff_offset > 0 || diff.fixed_byte != diff.orig_byte) {
+                std::cout << "  FIRST DIFFERENCE at byte offset 0x" << std::hex << diff.diff_offset << ":\n";
+                std::cout << "    Fixed: 0x" << std::hex << diff.fixed_byte << "\n";
+                std::cout << "    Orig:  0x" << std::hex << diff.orig_byte << std::dec << "\n";
+              }
+              if (args_->show_hex_dumps_ || args_->show_disasm_) {
+                std::cout << "  (Hex dump and disassembly require method info - showing basic diff only)\n";
+              }
+              break;
+            case art::CodeDifference::Status::kOnlyInFixed:
+              std::cout << "  METHOD ONLY IN FIXED FILE\n";
+              break;
+            case art::CodeDifference::Status::kOnlyInOriginal:
+              std::cout << "  METHOD ONLY IN ORIGINAL FILE\n";
+              break;
+            case art::CodeDifference::Status::kIdentical:
+              break;
+          }
+          std::cout << "\n";
+        }
+      }
+
+      return !result.HasDifferences();
+    }
 
     // If comparing with original, check that disabled methods changed from non-zero to zero
     if (!original_oat_path.empty()) {

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <set>
 #include <tuple>
@@ -26,6 +27,9 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 
 #include "base/hex_dump.h"
 #include "cmdline.h"
@@ -156,6 +160,9 @@ struct CodeDifference {
   bool size_differs = false;
   enum class Status { kIdentical, kDifferent, kOnlyInFixed, kOnlyInOriginal };
   Status status = Status::kIdentical;
+  // Code pointers for hex dump and disassembly
+  const uint8_t* fixed_code_ptr = nullptr;
+  const uint8_t* orig_code_ptr = nullptr;
 };
 
 // Code comparison result class
@@ -282,6 +289,8 @@ static std::optional<CodeDifference> CompareMethodCode(
   diff.dex_file_idx = fixed_method.dex_file_idx;
   diff.class_def_idx = fixed_method.class_def_idx;
   diff.method_idx = fixed_method.method_idx;
+  diff.fixed_code_ptr = fixed_method.code_ptr;
+  diff.orig_code_ptr = orig_method.code_ptr;
 
   if (fixed_dex_file != nullptr) {
     if (fixed_method.method_idx < fixed_dex_file->NumMethodIds()) {
@@ -294,38 +303,72 @@ static std::optional<CodeDifference> CompareMethodCode(
     }
   }
 
+  // ARM64 BL (Branch with Link) instruction mask.
+  // BL encoding: bits[31]=1, bits[30:26]=00101, bits[25:0]=imm26
+  // Mask: 0xFC000000, Match: 0x94000000
+  static constexpr uint32_t kBlMask = 0xFC000000u;
+  static constexpr uint32_t kBlOpcode = 0x94000000u;
+
+  // Check if a 4-byte instruction at offset is a BL instruction.
+  // ARM64 is little-endian, so we can directly cast to uint32_t*.
+  auto IsBlInsn = [](const uint8_t* code, uint32_t offset) -> bool {
+    if (offset + 4 > static_cast<uint32_t>(-1)) {
+      return false;
+    }
+    uint32_t insn = *reinterpret_cast<const uint32_t*>(code + offset);
+    return (insn & kBlMask) == kBlOpcode;
+  };
+
   diff.fixed_size = fixed_method.code_size;
   diff.orig_size = orig_method.code_size;
 
-  if (fixed_method.code_size == orig_method.code_size &&
-      fixed_method.code_ptr != nullptr && orig_method.code_ptr != nullptr &&
-      memcmp(fixed_method.code_ptr, orig_method.code_ptr, fixed_method.code_size) == 0) {
+  // Compare code byte-by-byte, skipping BL instructions.
+  // BL uses PC-relative offset which may differ between BCP versions
+  // due to different boot image layout and OAT linking.
+  uint32_t fixed_idx = 0;
+  uint32_t orig_idx = 0;
+  bool has_difference = false;
+  uint32_t diff_offset = 0;
+  uint32_t diff_fixed_byte = 0;
+  uint32_t diff_orig_byte = 0;
+
+  while (fixed_idx < fixed_method.code_size && orig_idx < orig_method.code_size) {
+    if (fixed_method.code_ptr[fixed_idx] != orig_method.code_ptr[orig_idx]) {
+      // Check if both are BL instructions - skip if so.
+      if (IsBlInsn(fixed_method.code_ptr, fixed_idx) &&
+          IsBlInsn(orig_method.code_ptr, orig_idx)) {
+        fixed_idx += 4;
+        orig_idx += 4;
+        continue;
+      }
+      // Real difference found.
+      has_difference = true;
+      diff_offset = fixed_idx;
+      diff_fixed_byte = fixed_method.code_ptr[fixed_idx];
+      diff_orig_byte = orig_method.code_ptr[orig_idx];
+      break;
+    }
+    fixed_idx++;
+    orig_idx++;
+  }
+
+  // Check if sizes differ (only relevant if no differences found yet).
+  if (!has_difference && fixed_method.code_size != orig_method.code_size) {
+    has_difference = true;
+  }
+
+  if (!has_difference) {
     diff.status = CodeDifference::Status::kIdentical;
     return std::nullopt;
   }
 
   diff.status = CodeDifference::Status::kDifferent;
-
   if (fixed_method.code_size != orig_method.code_size) {
     diff.size_differs = true;
   }
-
-  uint32_t min_size = std::min(fixed_method.code_size, orig_method.code_size);
-  uint32_t offset = 0;
-  if (fixed_method.code_ptr != nullptr && orig_method.code_ptr != nullptr) {
-    while (offset < min_size) {
-      if (fixed_method.code_ptr[offset] != orig_method.code_ptr[offset]) {
-        break;
-      }
-      offset++;
-    }
-  }
-
-  if (offset < min_size) {
-    diff.diff_offset = offset;
-    diff.fixed_byte = fixed_method.code_ptr[offset];
-    diff.orig_byte = orig_method.code_ptr[offset];
-  }
+  diff.diff_offset = diff_offset;
+  diff.fixed_byte = diff_fixed_byte;
+  diff.orig_byte = diff_orig_byte;
 
   return diff;
 }
@@ -407,6 +450,78 @@ static CodeComparisonResult CompareOatFiles(
   return result;
 }
 
+// Helper function to run objdump on code bytes
+static bool DisassembleWithObjdump(const uint8_t* code, uint32_t size, const std::string& label) {
+  if (code == nullptr || size == 0) {
+    std::cout << "  " << label << ": (no code)\n";
+    return false;
+  }
+
+  // Write code to a temporary file
+  char temp_path[] = "/tmp/art_code_XXXXXX";
+  int fd = mkstemp(temp_path);
+  if (fd < 0) {
+    std::cerr << "  Failed to create temp file for objdump\n";
+    return false;
+  }
+
+  FILE* f = fdopen(fd, "wb");
+  if (f == nullptr) {
+    close(fd);
+    std::cerr << "  Failed to open temp file for objdump\n";
+    return false;
+  }
+
+  fwrite(code, 1, size, f);
+  fclose(f);
+
+  // Run objdump
+  std::string cmd = "aarch64-linux-gnu-objdump -b binary -m aarch64 -D " + std::string(temp_path) + " 2>/dev/null";
+  FILE* objdump_fp = popen(cmd.c_str(), "r");
+  if (objdump_fp == nullptr) {
+    std::cerr << "  Failed to run objdump (aarch64-linux-gnu-objdump)\n";
+    unlink(temp_path);
+    return false;
+  }
+
+  std::cout << "  " << label << " disassembly:\n";
+  char buf[256];
+  while (fgets(buf, sizeof(buf), objdump_fp) != nullptr) {
+    // Indent objdump output
+    for (char* p = buf; *p; ++p) {
+      if (*p == '\n') {
+        std::cout << "    | ";
+        break;
+      }
+    }
+    std::cout << buf;
+  }
+  pclose(objdump_fp);
+  unlink(temp_path);
+  return true;
+}
+
+// Helper to print hex dump
+static void PrintHexDump(const uint8_t* code, uint32_t size, const std::string& label, uint32_t max_bytes = 128) {
+  if (code == nullptr || size == 0) {
+    std::cout << "  " << label << ": (no code)\n";
+    return;
+  }
+
+  uint32_t dump_size = std::min(size, max_bytes);
+  std::cout << "  " << label << " hex (" << dump_size << " of " << size << " bytes):\n    ";
+  for (uint32_t i = 0; i < dump_size; i++) {
+    printf("%02x ", code[i]);
+    if ((i + 1) % 16 == 0 && i < dump_size - 1) {
+      std::cout << "\n    ";
+    }
+  }
+  if (dump_size < size) {
+    std::cout << "\n    ... (" << (size - dump_size) << " more bytes)";
+  }
+  std::cout << "\n";
+}
+
 }  // namespace art
 
 struct TestFixValidationArgs : public art::CmdlineArgs {
@@ -417,7 +532,7 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
   char const* fixed_oat_file_ = nullptr;
   char const* original_oat_file_ = nullptr;
   bool compare_code_ = false;
-  uint32_t max_diffs_ = 100;
+  uint32_t max_diffs_ = 10;
   bool show_hex_dumps_ = true;
   bool show_disasm_ = true;
 
@@ -584,16 +699,14 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
         std::cout << "\n=== Detailed Differences ===\n";
         size_t count = 0;
         for (const auto& diff : result.GetDifferences()) {
+          if (diff.status == art::CodeDifference::Status::kIdentical) {
+            continue;
+          }
           if (count++ >= args_->max_diffs_) {
             std::cout << "... (stopped at " << args_->max_diffs_ << " differences)\n";
             break;
           }
-          if (diff.status == art::CodeDifference::Status::kIdentical) {
-            continue;
-          }
 
-          // For now, just print the method info without hex dump/disasm
-          // (hex dump requires re-collecting method info which is complex)
           std::cout << "METHOD: " << diff.class_name << "->" << diff.method_name << "\n";
           std::cout << "  dex=" << diff.dex_file_idx
                     << " class_def=" << diff.class_def_idx
@@ -610,15 +723,32 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
                 std::cout << "    Fixed: 0x" << std::hex << diff.fixed_byte << "\n";
                 std::cout << "    Orig:  0x" << std::hex << diff.orig_byte << std::dec << "\n";
               }
-              if (args_->show_hex_dumps_ || args_->show_disasm_) {
-                std::cout << "  (Hex dump and disassembly require method info - showing basic diff only)\n";
+              if (args_->show_hex_dumps_) {
+                art::PrintHexDump(diff.fixed_code_ptr, diff.fixed_size, "Fixed", 64);
+                art::PrintHexDump(diff.orig_code_ptr, diff.orig_size, "Orig", 64);
+              }
+              if (args_->show_disasm_) {
+                art::DisassembleWithObjdump(diff.fixed_code_ptr, diff.fixed_size, "Fixed");
+                art::DisassembleWithObjdump(diff.orig_code_ptr, diff.orig_size, "Orig");
               }
               break;
             case art::CodeDifference::Status::kOnlyInFixed:
               std::cout << "  METHOD ONLY IN FIXED FILE\n";
+              if (args_->show_hex_dumps_) {
+                art::PrintHexDump(diff.fixed_code_ptr, diff.fixed_size, "Fixed", 64);
+              }
+              if (args_->show_disasm_) {
+                art::DisassembleWithObjdump(diff.fixed_code_ptr, diff.fixed_size, "Fixed");
+              }
               break;
             case art::CodeDifference::Status::kOnlyInOriginal:
               std::cout << "  METHOD ONLY IN ORIGINAL FILE\n";
+              if (args_->show_hex_dumps_) {
+                art::PrintHexDump(diff.orig_code_ptr, diff.orig_size, "Orig", 64);
+              }
+              if (args_->show_disasm_) {
+                art::DisassembleWithObjdump(diff.orig_code_ptr, diff.orig_size, "Orig");
+              }
               break;
             case art::CodeDifference::Status::kIdentical:
               break;

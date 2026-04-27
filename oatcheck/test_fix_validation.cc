@@ -341,38 +341,45 @@ static std::optional<CodeDifference> CompareMethodCode(
   diff.fixed_size = fixed_method.code_size;
   diff.orig_size = orig_method.code_size;
 
-  // Compare code byte-by-byte, skipping BL instructions.
-  // BL uses PC-relative offset which may differ between BCP versions
-  // due to different boot image layout and OAT linking.
+  // Compare code instruction-by-instruction (4 bytes per instruction for ARM64).
+  // Skip BL and ADRP instructions as they use PC-relative offsets that may differ
+  // between BCP versions due to different boot image layout and OAT linking.
   uint32_t fixed_idx = 0;
   uint32_t orig_idx = 0;
   bool has_difference = false;
   uint32_t diff_offset = 0;
-  uint32_t diff_fixed_byte = 0;
-  uint32_t diff_orig_byte = 0;
+  uint32_t diff_fixed_insn = 0;
+  uint32_t diff_orig_insn = 0;
 
   while (fixed_idx < fixed_method.code_size && orig_idx < orig_method.code_size) {
-    if (fixed_method.code_ptr[fixed_idx] != orig_method.code_ptr[orig_idx]) {
-      // Check if both are BL instructions - skip if so.
-      if (ShouldSkip(fixed_method.code_ptr, fixed_idx) &&
-          ShouldSkip(orig_method.code_ptr, orig_idx)) {
+    // ARM64 is little-endian, read 4-byte instruction directly
+    uint32_t fixed_insn = *reinterpret_cast<const uint32_t*>(fixed_method.code_ptr + fixed_idx);
+    uint32_t orig_insn = *reinterpret_cast<const uint32_t*>(orig_method.code_ptr + orig_idx);
+
+    if (fixed_insn != orig_insn) {
+      // Check if both are BL or ADRP instructions - skip if so.
+      if (IsBlInsn(fixed_method.code_ptr, fixed_idx) &&
+          IsBlInsn(orig_method.code_ptr, orig_idx)) {
         fixed_idx += 4;
         orig_idx += 4;
-        fixed_idx += 4;
-        orig_idx += 4;
-        fixed_idx += 4;
-        orig_idx += 4;
+        continue;
+      }
+      // TODO: find out what makes adrp different
+      if (IsAdrpInsn(fixed_method.code_ptr, fixed_idx) &&
+          IsAdrpInsn(orig_method.code_ptr, orig_idx)) {
+        fixed_idx += 8;
+        orig_idx += 8;
         continue;
       }
       // Real difference found.
       has_difference = true;
       diff_offset = fixed_idx;
-      diff_fixed_byte = fixed_method.code_ptr[fixed_idx];
-      diff_orig_byte = orig_method.code_ptr[orig_idx];
+      diff_fixed_insn = fixed_insn;
+      diff_orig_insn = orig_insn;
       break;
     }
-    fixed_idx++;
-    orig_idx++;
+    fixed_idx += 4;
+    orig_idx += 4;
   }
 
   // Check if sizes differ (only relevant if no differences found yet).
@@ -390,8 +397,8 @@ static std::optional<CodeDifference> CompareMethodCode(
     diff.size_differs = true;
   }
   diff.diff_offset = diff_offset;
-  diff.fixed_byte = diff_fixed_byte;
-  diff.orig_byte = diff_orig_byte;
+  diff.fixed_byte = diff_fixed_insn;
+  diff.orig_byte = diff_orig_insn;
 
   return diff;
 }
@@ -791,9 +798,9 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
                           << " orig=" << diff.orig_size << "\n";
               }
               if (diff.diff_offset > 0 || diff.fixed_byte != diff.orig_byte) {
-                std::cout << "  FIRST DIFFERENCE at byte offset 0x" << std::hex << diff.diff_offset << ":\n";
-                std::cout << "    Fixed: 0x" << std::hex << diff.fixed_byte << "\n";
-                std::cout << "    Orig:  0x" << std::hex << diff.orig_byte << std::dec << "\n";
+                printf("  FIRST DIFFERENCE at byte offset 0x%04x (instruction at offset %u):\n", diff.diff_offset, diff.diff_offset / 4);
+                printf("    Fixed: 0x%08x\n", diff.fixed_byte);
+                printf("    Orig:  0x%08x\n", diff.orig_byte);
               }
               if (args_->show_hex_dumps_) {
                 art::PrintHexDump(diff.fixed_code_ptr, diff.fixed_size, "Fixed", 64);

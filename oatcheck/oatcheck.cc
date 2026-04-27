@@ -2076,6 +2076,9 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
           }
         }
 
+        *os << "\n=== Compiled Method Count ===\n";
+        *os << "Total compiled methods: " << compiled_methods->size() << "\n";
+
         *os << "\n=== AOT Invalidation Detection Results ===\n";
         *os << "Total AOT-invalidated methods: " << aot_invalidated_methods << "\n";
         // Statistics: interface vs class layout affected methods

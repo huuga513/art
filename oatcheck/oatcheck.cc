@@ -64,6 +64,28 @@ enum class DependencyType {
   kDependencyTypeCount
 };
 
+// Interface method change types for detailed diff
+enum class MethodChangeType {
+  kDeleted,   // existed in old but not in new
+  kAdded,     // existed in new but not in old
+  kModified   // existed in both but signature changed
+};
+
+struct MethodChangeDetail {
+  MethodChangeType type;
+  std::string method_name;
+  std::string old_sig;  // empty if kAdded
+  std::string new_sig;  // empty if kDeleted
+
+  MethodChangeDetail(MethodChangeType t, const std::string& name, const std::string& old_s, const std::string& new_s)
+      : type(t), method_name(name), old_sig(old_s), new_sig(new_s) {}
+};
+
+struct InterfaceMethodDiff {
+  std::string interface_descriptor;
+  std::vector<MethodChangeDetail> changes;
+};
+
 // Interface method change: independent change tracking for invoke-interface
 // Key: interface_descriptor, Value: set of "method_name:signature" that changed
 using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_set<std::string>>;
@@ -71,6 +93,7 @@ using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_se
 // Global counters for statistics (will be removed later)
 static size_t g_interface_affected_methods = 0;
 static size_t g_class_layout_affected_methods = 0;
+static size_t g_printed_interface_diff_count = 0;
 
 struct DexSymId {
   uint64_t id;
@@ -814,9 +837,23 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
         if (is_old_interface && is_new_interface) {
           // Both are interfaces: check for method changes
-          auto changes = DetectInterfaceMethodChanges(old_class_accessor, new_class_accessor);
-          if (!changes.empty()) {
-            interface_method_changes_[class_descriptor] = std::move(changes);
+          auto diff = DetectInterfaceMethodChanges(old_class_accessor, new_class_accessor);
+          if (!diff.changes.empty()) {
+            // Store detailed diff for printing
+            interface_method_diffs_[class_descriptor] = diff;
+
+            // Also convert to the simple set format for backward compatibility
+            std::unordered_set<std::string> simple_changes;
+            for (const auto& change : diff.changes) {
+              if (change.type == MethodChangeType::kDeleted) {
+                simple_changes.insert(change.method_name + ":" + change.old_sig);
+              } else if (change.type == MethodChangeType::kAdded) {
+                simple_changes.insert(change.method_name + ":" + change.new_sig);
+              } else if (change.type == MethodChangeType::kModified) {
+                simple_changes.insert(change.method_name + ":" + change.new_sig);
+              }
+            }
+            interface_method_changes_[class_descriptor] = std::move(simple_changes);
             interface_method_changes_counter += interface_method_changes_[class_descriptor].size();
           }
         } else if (is_old_interface && !is_new_interface) {
@@ -853,41 +890,89 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         }
       }
     }
+    // Print first 10 changed interfaces with detailed diff
+    size_t printed_count = 0;
+    for (const auto& [iface_desc, diff] : interface_method_diffs_) {
+      if (printed_count >= 10) break;
+      LOG(INFO) << "=== Interface Change #" << (printed_count + 1) << " ===";
+      LOG(INFO) << "Interface: " << iface_desc;
+      for (const auto& change : diff.changes) {
+        if (change.type == MethodChangeType::kDeleted) {
+          LOG(INFO) << "  - DELETED: " << change.method_name << change.old_sig;
+        } else if (change.type == MethodChangeType::kAdded) {
+          LOG(INFO) << "  + ADDED: " << change.method_name << change.new_sig;
+        } else if (change.type == MethodChangeType::kModified) {
+          LOG(INFO) << "  ~ MODIFIED: " << change.method_name << change.old_sig << " -> " << change.method_name << change.new_sig;
+        }
+      }
+      printed_count++;
+    }
+    if (printed_count > 0) {
+      LOG(INFO) << "Printed " << printed_count << " interface changes (first 10 of " << interface_method_diffs_.size() << " total)";
+    }
+
     LOG(INFO) << "Found " << initial_changed_class_counter << "(s) initial changed classes";
     LOG(INFO) << "Found " << interface_method_changes_counter << "(s) interface method changes";
   }
 
  private:
-  // Detect interface method changes: returns set of "method_name:signature" that changed
-  std::unordered_set<std::string> DetectInterfaceMethodChanges(
+  // Detect interface method changes: returns detailed diff of method changes
+  InterfaceMethodDiff DetectInterfaceMethodChanges(
       const art::ClassAccessor& old_interface,
       const art::ClassAccessor& new_interface) {
-    std::unordered_set<std::string> changed_methods;
+    InterfaceMethodDiff result;
+    result.interface_descriptor = old_interface.GetDescriptor();
 
     // Build map of old methods: method_name -> signature
+    // Use name:sig as key to handle Java method overloading correctly
     std::map<std::string, std::string> old_methods;
     for (const auto& method : old_interface.GetMethods()) {
       const auto& method_id = old_interface.GetDexFile().GetMethodId(method.GetIndex());
       const char* name = old_interface.GetDexFile().GetMethodName(method_id);
       Signature sig = old_interface.GetDexFile().GetMethodSignature(method_id);
-      old_methods[std::string(name)] = sig.ToString();
+      std::string method_key = std::string(name) + ":" + sig.ToString();
+      old_methods[method_key] = sig.ToString();
     }
 
-    // Compare with new methods
+    // Build set of new method keys (name:sig) for quick lookup
+    std::set<std::string> new_method_keys;
+    std::map<std::string, std::string> new_methods;
     for (const auto& method : new_interface.GetMethods()) {
       const auto& method_id = new_interface.GetDexFile().GetMethodId(method.GetIndex());
       const char* name = new_interface.GetDexFile().GetMethodName(method_id);
       Signature sig = new_interface.GetDexFile().GetMethodSignature(method_id);
       std::string method_key = std::string(name) + ":" + sig.ToString();
+      new_method_keys.insert(method_key);
+      new_methods[method_key] = sig.ToString();
+    }
 
-      auto it = old_methods.find(std::string(name));
-      if (it == old_methods.end() || it->second != sig.ToString()) {
-        // Method name or signature changed
-        changed_methods.insert(method_key);
+    // Find deleted methods (in old but not in new)
+    for (const auto& [method_key, sig] : old_methods) {
+      if (new_method_keys.find(method_key) == new_method_keys.end()) {
+        // Extract method name from method_key (name:sig format)
+        size_t colon_pos = method_key.find(':');
+        std::string method_name = method_key.substr(0, colon_pos);
+        result.changes.push_back(MethodChangeDetail(MethodChangeType::kDeleted, method_name, sig, ""));
       }
     }
 
-    return changed_methods;
+    // Find added and modified methods
+    for (const auto& [method_key, sig] : new_methods) {
+      auto it = old_methods.find(method_key);
+      if (it == old_methods.end()) {
+        // Added: in new but not in old
+        size_t colon_pos = method_key.find(':');
+        std::string method_name = method_key.substr(0, colon_pos);
+        result.changes.push_back(MethodChangeDetail(MethodChangeType::kAdded, method_name, "", sig));
+      } else if (it->second != sig) {
+        // Modified: same name:sig key but different signature (shouldn't happen but handle it)
+        size_t colon_pos = method_key.find(':');
+        std::string method_name = method_key.substr(0, colon_pos);
+        result.changes.push_back(MethodChangeDetail(MethodChangeType::kModified, method_name, it->second, sig));
+      }
+    }
+
+    return result;
   }
 
  public:
@@ -1105,6 +1190,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
   // Interface method changes: interface_descriptor -> set of changed method keys
   InterfaceMethodChanges interface_method_changes_;
+
+  // Detailed interface method diffs: interface_descriptor -> detailed diff (for printing)
+  std::map<std::string, InterfaceMethodDiff> interface_method_diffs_;
 
   // Changed class info: class_descriptor -> bitset of change types
   // This is used to propagate changes to the app dependency graph

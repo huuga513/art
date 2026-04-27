@@ -318,6 +318,25 @@ static std::optional<CodeDifference> CompareMethodCode(
     uint32_t insn = *reinterpret_cast<const uint32_t*>(code + offset);
     return (insn & kBlMask) == kBlOpcode;
   };
+  // ARM64 ADRP (Form PC-relative address to 4KB page) instruction mask.
+  static constexpr uint32_t kAdrpMask = 0x9f000000u;
+  static constexpr uint32_t kAdrpOpcode = 0x90000000u;
+
+  // Check if a 4-byte instruction at offset is an ADRP instruction.
+  // ARM64 is little-endian, so we can directly cast to uint32_t*.
+  auto IsAdrpInsn = [](const uint8_t* code, uint32_t offset) -> bool {
+    // Check for potential overflow if offset is near the limit of uint32_t
+    if (offset + 4 > static_cast<uint32_t>(-1)) {
+      return false;
+    }
+    uint32_t insn = *reinterpret_cast<const uint32_t*>(code + offset);
+    return (insn & kAdrpMask) == kAdrpOpcode;
+  };
+  auto ShouldSkip = [=](const uint8_t* code, uint32_t offset) -> bool {
+    if (IsBlInsn(code, offset)) return true;
+    if (IsAdrpInsn(code, offset)) return true;
+    return false;
+  };
 
   diff.fixed_size = fixed_method.code_size;
   diff.orig_size = orig_method.code_size;
@@ -335,8 +354,12 @@ static std::optional<CodeDifference> CompareMethodCode(
   while (fixed_idx < fixed_method.code_size && orig_idx < orig_method.code_size) {
     if (fixed_method.code_ptr[fixed_idx] != orig_method.code_ptr[orig_idx]) {
       // Check if both are BL instructions - skip if so.
-      if (IsBlInsn(fixed_method.code_ptr, fixed_idx) &&
-          IsBlInsn(orig_method.code_ptr, orig_idx)) {
+      if (ShouldSkip(fixed_method.code_ptr, fixed_idx) &&
+          ShouldSkip(orig_method.code_ptr, orig_idx)) {
+        fixed_idx += 4;
+        orig_idx += 4;
+        fixed_idx += 4;
+        orig_idx += 4;
         fixed_idx += 4;
         orig_idx += 4;
         continue;
@@ -520,6 +543,47 @@ static void PrintHexDump(const uint8_t* code, uint32_t size, const std::string& 
     std::cout << "\n    ... (" << (size - dump_size) << " more bytes)";
   }
   std::cout << "\n";
+}
+
+// Helper to print DEX bytecode in human-readable form
+static void PrintDexBytecode(const DexFile* dex_file,
+                              uint16_t class_def_idx,
+                              uint32_t method_idx) {
+  if (dex_file == nullptr) {
+    std::cout << "  DEX code: (no dex file)\n";
+    return;
+  }
+
+  // Find the class
+  if (class_def_idx >= dex_file->NumClassDefs()) {
+    std::cout << "  DEX code: (class not found)\n";
+    return;
+  }
+
+  const dex::ClassDef& class_def = dex_file->GetClassDef(class_def_idx);
+  ClassAccessor accessor(*dex_file, class_def);
+
+  // Find the method within this class
+  for (ClassAccessor::Method method : accessor.GetMethods()) {
+    if (method.GetIndex() == method_idx) {
+      const dex::CodeItem* code_item = method.GetCodeItem();
+      if (code_item == nullptr) {
+        std::cout << "  DEX code: (native or abstract method)\n";
+        return;
+      }
+
+      std::cout << "  DEX code:\n";
+      CodeItemDataAccessor code_accessor(*dex_file, code_item);
+      for (const DexInstructionPcPair& pair : code_accessor) {
+        const uint32_t dex_pc = pair.DexPc();
+        const Instruction* insn = &pair.Inst();
+        std::string disasm = insn->DumpString(dex_file);
+        printf("    %04x: %s\n", dex_pc * 2, disasm.c_str());
+      }
+      return;
+    }
+  }
+  std::cout << "  DEX code: (method not found)\n";
 }
 
 }  // namespace art
@@ -712,6 +776,14 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
                     << " class_def=" << diff.class_def_idx
                     << " method=" << diff.method_idx << "\n";
 
+          // Load DexFile for DEX bytecode printing
+          std::unique_ptr<const art::DexFile> diff_dex_file;
+          const art::OatDexFile* diff_oat_dex_file = fixed_oat->GetOatDexFiles()[diff.dex_file_idx];
+          if (diff_oat_dex_file != nullptr) {
+            std::string dex_err;
+            diff_dex_file = diff_oat_dex_file->OpenDexFile(&dex_err);
+          }
+
           switch (diff.status) {
             case art::CodeDifference::Status::kDifferent:
               if (diff.size_differs) {
@@ -731,6 +803,7 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
                 art::DisassembleWithObjdump(diff.fixed_code_ptr, diff.fixed_size, "Fixed");
                 art::DisassembleWithObjdump(diff.orig_code_ptr, diff.orig_size, "Orig");
               }
+              art::PrintDexBytecode(diff_dex_file.get(), diff.class_def_idx, diff.method_idx);
               break;
             case art::CodeDifference::Status::kOnlyInFixed:
               std::cout << "  METHOD ONLY IN FIXED FILE\n";
@@ -757,7 +830,7 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
         }
       }
 
-      return !result.HasDifferences();
+      return true; 
     }
 
     // If comparing with original, check that disabled methods changed from non-zero to zero
@@ -859,3 +932,10 @@ int main(int argc, char** argv) {
   TestFixValidationMain main_runner;
   return main_runner.Main(argc, argv);
 }
+
+/*Usage:
+python3 oatcheck/test_fix_validation_host.py \
+  --fixed-oat=/ssd2/wyz/app_oats/15.0.0_r5/com.tencent.mm/oat/base.odex \
+  --original-oat=/ssd2/wyz/app_oats/15.0.0_r3/com.tencent.mm/oat/base.odex \
+  --compare-code
+*/

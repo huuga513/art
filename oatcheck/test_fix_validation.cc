@@ -606,6 +606,7 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
   uint32_t max_diffs_ = 10;
   bool show_hex_dumps_ = true;
   bool show_disasm_ = true;
+  bool show_dex_instructions_ = true;
 
   ParseStatus ParseCustom(const char* raw_option,
                           size_t raw_option_length,
@@ -628,6 +629,10 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
       show_disasm_ = true;
     } else if (option == "--no-disasm") {
       show_disasm_ = false;
+    } else if (option == "--dex-instructions") {
+      show_dex_instructions_ = true;
+    } else if (option == "--no-dex-instructions") {
+      show_dex_instructions_ = false;
     } else {
       return Base::ParseCustom(raw_option, raw_option_length, error_msg);
     }
@@ -642,6 +647,7 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
     std::cerr << "  --max-diffs=N           Maximum differences to show (default 100)\n";
     std::cerr << "  --hex-dumps / --no-hex-dumps  Show/hide hex dumps (default show)\n";
     std::cerr << "  --disasm / --no-disasm  Show/hide ARM64 disassembly (default show)\n";
+    std::cerr << "  --dex-instructions / --no-dex-instructions  Show/hide DEX instructions (default show)\n";
     Base::PrintUsage();
   }
 };
@@ -810,7 +816,9 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
                 art::DisassembleWithObjdump(diff.fixed_code_ptr, diff.fixed_size, "Fixed");
                 art::DisassembleWithObjdump(diff.orig_code_ptr, diff.orig_size, "Orig");
               }
-              art::PrintDexBytecode(diff_dex_file.get(), diff.class_def_idx, diff.method_idx);
+              if (args_->show_dex_instructions_) {
+                art::PrintDexBytecode(diff_dex_file.get(), diff.class_def_idx, diff.method_idx);
+              }
               break;
             case art::CodeDifference::Status::kOnlyInFixed:
               std::cout << "  METHOD ONLY IN FIXED FILE\n";

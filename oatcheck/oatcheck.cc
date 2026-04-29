@@ -98,8 +98,9 @@ static size_t g_printed_interface_diff_count = 0;
 struct DexSymId {
   uint64_t id;
   // 64-bit layout (high to low):
-  // | 24 bits unused | 8 bits dex_file_index | 16 bits class_def_id | 16 bits method_def_id |
-  // Bits 63-40: unused (reserved)
+  // | 1 bit is bcp dex| 23 bits unused | 8 bits dex_file_index | 16 bits class_def_id | 16 bits method_def_id |
+  // Bit  63: is in bcp
+  // Bits 62-40: unused (reserved)
   // Bits 39-32: dex file index (0-255), 0xFF indicates external class
   // Bits 31-16: class_def_id (0-65535), class definition index in DEX file
   // Bits 15-0: method_def_id (0-65535), method index in DEX file, 0xFFFF indicates this is a class (not a method)
@@ -107,6 +108,17 @@ struct DexSymId {
   // For class: method_def_id = 0xFFFF
   // For method: class_def_id = class_def_index of defining class, method_def_id = method index
   // For external class: dex_file_index = 0xFF
+  void SetIsBcpDex(bool is_bcp_dex) {
+    if (is_bcp_dex) {
+        id |= (uint64_t(1) << 63);
+    } else {
+        id &= ~(uint64_t(1) << 63);
+    }
+  }
+  bool IsBcpDex() const {
+    bool highest_bit = (id >> 63) & 1;
+    return highest_bit;
+  }
   void SetDexFileIndex(uint32_t dex_file_index) {
     id = (id & 0xFFFFFF00FFFFFFFFULL) | (static_cast<uint64_t>(dex_file_index & 0xFF) << 32);
   }
@@ -148,6 +160,7 @@ struct DexSymId {
   // Construct DexSymId from graaf vertex_id_t. Since vertex_id_t is directly
   // mapped to DexSymId.id, we can directly assign it.
   explicit DexSymId(graaf::vertex_id_t vertex_id) : id(static_cast<uint64_t>(vertex_id)) {}
+  bool operator==(const DexSymId& other) const {return id==other.id;}
 };
 
 class DependencyGraphNode {
@@ -603,6 +616,179 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
   BcpDependencyGraph& bcp_graph_;
 };
 
+// BCP method dependency graph builder - reuses DependencyGraphBuilder logic
+// but processes ALL BCP methods (not filtered by compiled methods)
+class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderBase {
+ public:
+  BcpMethodDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths,
+                                   DependencyGraph* graph)
+      : jar_file_paths_(jar_file_paths), graph_(*graph) {}
+
+  bool BuildGraph(std::string* error_msg) override {
+    if (!ExtractDexFromJars(error_msg)) {
+      return false;
+    }
+
+    size_t i = 0;
+    // Step 1: Build descriptor -> DexSymId mapping for all dex files
+    for (const auto& dex : dex_files_) {
+      if (!BuildDescriptorMapping(dex.get(), i, &graph_)) {
+        LOG(ERROR) << "Failed to build descriptor mapping: " << *error_msg;
+        return false;
+      }
+      i++;
+    }
+    // Step 2: Analyze classes and methods using the mapping
+    i = 0;
+    for (const auto& dex : dex_files_) {
+      if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
+        LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
+        return false;
+      }
+      if (!BuildDependencyEdges(dex.get(), i, &graph_)) {
+        LOG(ERROR) << "Failed to build dependency edges: " << *error_msg;
+        return false;
+      }
+      i++;
+    }
+    LOG(INFO) << "BCP method graph built: " << graph_.Summary();
+    return true;
+  }
+
+ private:
+  // Extract all classes*.dex from all JAR files into `dex_files_`.
+  bool ExtractDexFromJars(std::string* error_msg) {
+    for (const char* jar_file_path : jar_file_paths_) {
+      if (jar_file_path == nullptr) {
+        continue;
+      }
+
+      art::DexFileLoader loader(jar_file_path, /*location=*/jar_file_path);
+      std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
+      bool success = loader.Open(
+          /*verify=*/true,
+          /*verify_checksum=*/true,
+          /*allow_no_dex_files=*/false,
+          error_msg,
+          &jar_dex_files);
+
+      if (!success || jar_dex_files.empty()) {
+        LOG(ERROR) << "Failed to load DEX from JAR " << jar_file_path << ": " << *error_msg;
+        return false;
+      }
+
+      for (auto& dex : jar_dex_files) {
+        dex_files_.push_back(std::move(dex));
+      }
+    }
+
+    if (dex_files_.empty()) {
+      *error_msg = "No DEX files loaded from any JAR files";
+      return false;
+    }
+
+    return true;
+  }
+
+  // Analyze method instructions and build method-level dependency edges.
+  // Processes ALL methods (no compiled_methods filtering).
+  bool AnalyzeDexMethods(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      uint16_t class_def_index = accessor.GetClassDefIndex();
+      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+        // Process all methods without filtering - no compiled_methods check
+
+        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
+        std::string method_name(dex->PrettyMethod(method.GetIndex()));
+        DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
+        graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
+
+        for (auto it = code.begin(); it != code.end(); it++) {
+          DexInstructionPcPair inst = *it;
+          if (IsInstructionInvoke(inst->Opcode())) {
+            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
+            switch (invoke_type) {
+              case kDexInvokeVirtual: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* class_descriptor = dex->GetStringData(name_id);
+                DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+                graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+                graph_.UpdateEdge(
+                    class_dex_sym_id,
+                    method_dex_sym_id,
+                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
+                break;
+              }
+              case kDexInvokeSuper:
+              case kDexInvokeDirect:
+              case kDexInvokeStatic: {
+                break;
+              }
+              case kDexInvokeInterface: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* interface_descriptor = dex->GetStringData(name_id);
+
+                // Check if this is a boot classpath interface
+                if (!IsBootClasspathClass(interface_descriptor)) {
+                  break;
+                }
+
+                // For BCP->BCP interface calls, create edge if interface is BCP
+                DexSymId interface_dex_sym_id = GetOrCreateDexSymId(interface_descriptor);
+                graph_.AddVertexIfAbsent(interface_dex_sym_id, interface_descriptor, false);
+                graph_.UpdateEdge(
+                    interface_dex_sym_id,
+                    method_dex_sym_id,
+                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
+                break;
+              }
+              default:{
+                LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
+                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
+                break;
+              }
+            }
+          } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
+            auto field_idx = inst->VRegC();
+            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+            graph_.UpdateEdge(
+                class_dex_sym_id,
+                method_dex_sym_id,
+                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
+          } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
+            auto field_idx = inst->VRegB();
+            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+            graph_.UpdateEdge(
+                class_dex_sym_id,
+                method_dex_sym_id,
+                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  std::vector<const char*> jar_file_paths_;
+  DependencyGraph& graph_;
+};
+
 class DependencyGraphBuilder : public DependencyGraphBuilderBase {
  public:
   // compiled_methods: set of (dex_file_idx, class_def_index, method_index) that have compiled code
@@ -878,6 +1064,43 @@ class DependencyGraphPropagator {
         succ_vertex.MergeChanges(edge.GetDeps() & vertex.GetChanges());
       }
     }
+  }
+
+  // Set initial changes on app dependency graph based on affected BCP methods.
+  // Marks app method nodes as changed if they correspond to affected BCP methods.
+  void SetInitialChangesFromBcpMethods(
+      const std::vector<DexSymId>& affected_bcp_methods) {
+    size_t initial_changed_nodes = 0;
+
+    for (const auto& [vertex_id, vertex] : graph_.GetVertices()) {
+      DexSymId dex_sym_id(vertex_id);
+
+      // Skip class nodes, only process method nodes
+      if (dex_sym_id.IsClass()) {
+        continue;
+      }
+      if (!dex_sym_id.IsBcpDex()) {
+        continue;
+      }
+      bool found = false;
+      for (auto t:affected_bcp_methods) {
+        DexSymId k = t;
+        k.SetIsBcpDex(true);
+        if (k.GetDexFileIndex()==dex_sym_id.GetDexFileIndex() && k.GetMethodDefId() == dex_sym_id.GetMethodDefId()) {
+          found = true;
+          initial_changed_nodes++;
+          break;
+        }
+      }
+
+      if (found) {
+        auto& graph_vertex = graph_.graph_.get_vertex(vertex_id);
+        graph_vertex.SetChange();
+        initial_changed_nodes++;
+      }
+    }
+
+    LOG(INFO) << "Set initial changes for " << initial_changed_nodes << " BCP method nodes";
   }
 
  private:
@@ -1217,7 +1440,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         const char* new_name = new_class_accessor.GetDexFile().GetFieldName(new_field_id);
         const char* old_type = old_class_accessor.GetDexFile().GetFieldTypeDescriptor(old_field_id);
         const char* new_type = new_class_accessor.GetDexFile().GetFieldTypeDescriptor(new_field_id);
-        if (old_it->GetIndex() != new_it->GetIndex() || strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
+        if (/*old_it->GetIndex() != new_it->GetIndex() || */strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
           static_fields_changed = true;
           break;
         }
@@ -1245,7 +1468,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         const char* new_name = new_class_accessor.GetDexFile().GetFieldName(new_field_id);
         const char* old_type = old_class_accessor.GetDexFile().GetFieldTypeDescriptor(old_field_id);
         const char* new_type = new_class_accessor.GetDexFile().GetFieldTypeDescriptor(new_field_id);
-        if (old_it->GetIndex() != new_it->GetIndex() ||strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
+        if (/*old_it->GetIndex() != new_it->GetIndex() ||*/strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
           instance_fields_changed = true;
           break;
         }
@@ -1273,7 +1496,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         const char* new_name = new_class_accessor.GetDexFile().GetMethodName(new_method_id);
         const Signature old_signature = old_class_accessor.GetDexFile().GetMethodSignature(old_method_id);
         const Signature new_signature = new_class_accessor.GetDexFile().GetMethodSignature(new_method_id);
-        if (old_it->GetIndex() != new_it->GetIndex() ||strcmp(old_name, new_name) != 0 || old_signature != new_signature) {
+        if (/*old_it->GetIndex() != new_it->GetIndex() ||*/strcmp(old_name, new_name) != 0 || old_signature != new_signature) {
           vtable_changed = true;
           break;
         }
@@ -1358,6 +1581,99 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& GetChangedClassInfo() const {
     return changed_class_info_;
   }
+};
+
+// BCP method dependency graph propagator
+// Propagates class changes to BCP methods and collects affected method descriptors
+class BcpMethodDependencyGraphPropagator {
+ public:
+  BcpMethodDependencyGraphPropagator(
+      DependencyGraph* bcp_method_graph,
+      const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info)
+      : bcp_method_graph_(*bcp_method_graph), changed_class_info_(changed_class_info) {}
+
+  // Set initial changes on BCP method graph based on changed BCP classes.
+  // Marks class nodes as initially changed. PropagateChanges() will then
+  // propagate these changes to method nodes through the dependency edges.
+  void SetInitialChangesFromBcpClassChanges() {
+    size_t initial_changed_classes = 0;
+
+    // Iterate through all class vertices in BCP method graph and mark them as changed
+    // if their descriptor is in changed_class_info
+    for (const auto& [vertex_id, vertex] : bcp_method_graph_.GetVertices()) {
+      DexSymId dex_sym_id(vertex_id);
+
+      // Only process class nodes, skip method nodes
+      if (!dex_sym_id.IsClass()) {
+        continue;
+      }
+
+      const std::string& class_descriptor = vertex.GetDescriptor();
+      auto it = changed_class_info_.find(class_descriptor);
+      if (it != changed_class_info_.end()) {
+        auto& graph_vertex = bcp_method_graph_.graph_.get_vertex(vertex_id);
+        graph_vertex.SetChanges(it->second);
+        initial_changed_classes++;
+      }
+    }
+
+    LOG(INFO) << "Set initial changes for " << initial_changed_classes << " BCP class nodes from class changes";
+  }
+
+  // Propagate changes through the BCP method dependency graph
+  void PropagateChanges() {
+    auto& inner_graph = bcp_method_graph_.graph_;
+    auto result = graaf::algorithm::dfs_topological_sort<DependencyGraphNode, DependencyGraphEdge>(
+        bcp_method_graph_.graph_);
+    if (!result.has_value()) {
+      LOG(ERROR) << "BCP method dependency graph has cycles!";
+      return;
+    }
+    const std::vector<graaf::vertex_id_t>& topo = result.value();
+
+    // Iterate in topological order
+    for (auto it = topo.begin(); it != topo.end(); ++it) {
+      graaf::vertex_id_t id = *it;
+      auto& vertex = inner_graph.get_vertex(id);
+
+      // For all successors (X where id → X, meaning X depends on id)
+      // If id has changes, X also gets those changes
+      auto successors = inner_graph.get_neighbors(id);
+      for (graaf::vertex_id_t succ_id : successors) {
+        auto& succ_vertex = inner_graph.get_vertex(succ_id);
+        auto edge = inner_graph.get_edge(id, succ_id);
+        succ_vertex.MergeChanges(edge.GetDeps() & vertex.GetChanges());
+      }
+    }
+  }
+
+  // Collect all affected BCP method descriptors after propagation
+  std::vector<DexSymId> CollectAffectedBcpMethods() {
+    std::vector<DexSymId> affected_methods;
+    size_t collected = 0;
+
+    for (const auto& [vertex_id, vertex] : bcp_method_graph_.GetVertices()) {
+      DexSymId dex_sym_id(vertex_id);
+
+      // Skip class nodes
+      if (dex_sym_id.IsClass()) {
+        continue;
+      }
+
+      if (vertex.IsChanged()) {
+        affected_methods.push_back(dex_sym_id);
+        collected++;
+      }
+    }
+
+    LOG(INFO) << "Collected " << collected << " affected BCP methods after propagation";
+    for (auto x:affected_methods) LOG(INFO) << "BCP invalid method:" << bcp_method_graph_.graph_.get_vertex(x.id).GetDescriptor();
+    return affected_methods;
+  }
+
+ private:
+  DependencyGraph& bcp_method_graph_;
+  const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info_;
 };
 
 class OatFileAnalyzer {
@@ -1745,9 +2061,16 @@ class InlineDependencyExpander {
 
       // For each B that is inlined by A
       for (graaf::vertex_id_t vertex_b_id : successors) {
-        // Skip if vertex B doesn't exist in original dependency graph
+        // If vertex B doesn't exist in original dependency graph, create it in expanded_graph
+        // B might be a BCP method that has changed - it will be marked during BCP method propagation
         if (!original_dep_graph_.graph_.has_vertex(vertex_b_id)) {
-          skipped_b_not_in_dep_graph++;
+          DexSymId bcp_method_symid(vertex_b_id);
+          const InlineCallGraphNode& vertex_b = inline_graph_.graph_.get_vertex(vertex_b_id);
+          std::string method_name = vertex_b.GetDescriptor();
+          expanded_graph->AddVertexIfAbsent(bcp_method_symid, method_name, false);  // is_changed=false
+          expanded_graph->UpdateEdge(bcp_method_symid, DexSymId(vertex_a_id), std::bitset<3>(true));
+          // B has no predecessors in original graph, so no C → B edges to propagate
+          // Skip to next B but don't count as skipped since we created the vertex
           continue;
         }
 
@@ -1787,7 +2110,7 @@ class InlineDependencyExpander {
     }
 
     LOG(INFO) << "Inline dependency expansion: skipped A not in dep graph: " << skipped_a_not_in_dep_graph
-              << ", skipped B not in dep graph: " << skipped_b_not_in_dep_graph
+              << ", B not in dep graph (created from inline): " << skipped_b_not_in_dep_graph
               << ", B has no neighbors: " << b_has_no_neighbors
               << ", new edges added: " << new_edges_added;
     return new_edges_added;
@@ -1872,7 +2195,6 @@ class InlineCallGraphBuilder {
         if (method_info.HasDexFileIndex()) {
           graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
           DexSymId callee_dex_sym_id(method_info.GetDexFileIndex(), caller_class_def_idx, method_info.GetMethodIndex());
-          graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
 
           // Try to get method name
           std::string method_name;
@@ -1883,7 +2205,11 @@ class InlineCallGraphBuilder {
           } else {
             // No ArtMethod*, use index as method name
             method_name = android::base::StringPrintf("d%uu%u", method_info.GetDexFileIndex(), method_info.GetMethodIndex());
+            if (method_info.GetDexFileIndexKind() == MethodInfo::kKindBCP) {
+              callee_dex_sym_id.SetIsBcpDex(true);
+            }
           }
+          graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
 
           graph_.AddVertexIfAbsent(callee_dex_sym_id, method_name, false);
           // If method A inlines method B, create edge A → B to indicate that A inlines B
@@ -2294,6 +2620,37 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         LOG(INFO) << "Setting initial changes from BCP diff on expanded dependency graph...";
         DependencyGraphPropagator propagator(&graph);
         propagator.SetInitialChangesFromBcp(changed_class_info);
+
+        // Build BCP method dependency graph and propagate to get affected BCP methods
+        LOG(INFO) << "Building BCP method dependency graph for method change analysis...";
+        std::vector<const char*> original_bcp_jars;
+        std::vector<std::string> original_paths_storage;
+        std::string origin_prefix = args_->origin_bcp_prefix_;
+        if (!origin_prefix.empty() && origin_prefix.back() != '/') {
+          origin_prefix += '/';
+        }
+        for (const auto& jar_relative_path : kBootClasspathJars) {
+          std::string full_path = origin_prefix + jar_relative_path.substr(1);
+          original_paths_storage.push_back(full_path);
+          original_bcp_jars.push_back(original_paths_storage.back().c_str());
+        }
+
+        // Use heap allocation to reduce stack usage
+        std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
+        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get());
+        if (!bcp_method_builder.BuildGraph(&error_msg)) {
+          LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
+          return false;
+        }
+
+        BcpMethodDependencyGraphPropagator bcp_method_propagator(bcp_method_graph.get(), changed_class_info);
+        bcp_method_propagator.SetInitialChangesFromBcpClassChanges();
+        bcp_method_propagator.PropagateChanges();
+        auto affected_bcp_methods = bcp_method_propagator.CollectAffectedBcpMethods();
+
+        // Set initial changes from BCP methods on app graph
+        LOG(INFO) << "Setting initial changes from affected BCP methods...";
+        propagator.SetInitialChangesFromBcpMethods(affected_bcp_methods);
 
         LOG(INFO) << "Propagating changes through expanded dependency graph...";
         propagator.PropagateChanges();

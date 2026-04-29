@@ -145,6 +145,29 @@ class OatFileValidator {
   std::vector<MethodInfo> methods_;
 };
 
+// Helper function to match method filter
+static bool MethodMatchesFilter(const std::string& class_name,
+                                const std::string& method_name,
+                                const std::string& filter) {
+  size_t arrow_pos = filter.find("->");
+  if (arrow_pos == std::string::npos) {
+    return false;
+  }
+  std::string filter_class = filter.substr(0, arrow_pos);
+  std::string filter_method_sig = filter.substr(arrow_pos + 2);
+
+  // Extract just the method name (before any '(' for signature)
+  size_t sig_pos = filter_method_sig.find('(');
+  std::string filter_method_name;
+  if (sig_pos != std::string::npos) {
+    filter_method_name = filter_method_sig.substr(0, sig_pos);
+  } else {
+    filter_method_name = filter_method_sig;
+  }
+
+  return class_name == filter_class && method_name == filter_method_name;
+}
+
 // Code difference structure
 struct CodeDifference {
   size_t dex_file_idx;
@@ -607,6 +630,7 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
   bool show_hex_dumps_ = true;
   bool show_disasm_ = true;
   bool show_dex_instructions_ = true;
+  char const* method_filter_ = nullptr;
 
   ParseStatus ParseCustom(const char* raw_option,
                           size_t raw_option_length,
@@ -633,6 +657,8 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
       show_dex_instructions_ = true;
     } else if (option == "--no-dex-instructions") {
       show_dex_instructions_ = false;
+    } else if (option.starts_with("--method=")) {
+      method_filter_ = raw_option + strlen("--method=");
     } else {
       return Base::ParseCustom(raw_option, raw_option_length, error_msg);
     }
@@ -648,6 +674,7 @@ struct TestFixValidationArgs : public art::CmdlineArgs {
     std::cerr << "  --hex-dumps / --no-hex-dumps  Show/hide hex dumps (default show)\n";
     std::cerr << "  --disasm / --no-disasm  Show/hide ARM64 disassembly (default show)\n";
     std::cerr << "  --dex-instructions / --no-dex-instructions  Show/hide DEX instructions (default show)\n";
+    std::cerr << "  --method=<sig>       Filter to method (e.g., Lcom/example/Class;->method(I)V)\n";
     Base::PrintUsage();
   }
 };
@@ -735,6 +762,70 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
     std::cout << "Total compiled methods: " << total_compiled_methods << "\n";
     std::cout << "Methods with code_offset == 0: " << disabled_count << "\n";
 
+    // Method filter mode - print method info directly without comparison
+    if (args_->method_filter_ != nullptr && original_oat_path.empty()) {
+      std::cout << "\n=== Method Filter Output ===\n";
+      bool found = false;
+      for (size_t i = 0; i < dex_file_count; ++i) {
+        const art::OatDexFile* oat_dex_file = fixed_oat->GetOatDexFiles()[i];
+        if (oat_dex_file == nullptr) {
+          continue;
+        }
+
+        std::string dex_error_msg;
+        std::unique_ptr<const art::DexFile> dex_file = oat_dex_file->OpenDexFile(&dex_error_msg);
+        if (dex_file == nullptr) {
+          continue;
+        }
+
+        for (art::ClassAccessor accessor : dex_file->GetClasses()) {
+          const uint16_t class_def_index = accessor.GetClassDefIndex();
+          const art::dex::ClassDef& class_def = dex_file->GetClassDef(class_def_index);
+          std::string_view descriptor = dex_file->GetTypeDescriptorView(class_def.class_idx_);
+          const std::string class_name = std::string(descriptor);
+          const art::OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
+          uint32_t class_method_index = 0;
+
+          for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+            const std::string method_name = dex_file->GetMethodName(method.GetIndex());
+            class_method_index++;
+
+            if (!art::MethodMatchesFilter(class_name, method_name, args_->method_filter_)) {
+              continue;
+            }
+
+            found = true;
+            std::cout << "METHOD: " << class_name << "->" << method_name << "\n";
+            std::cout << "  dex=" << i << " class_def=" << class_def_index << " method=" << method.GetIndex() << "\n";
+
+            const art::OatFile::OatMethod oat_method = oat_class.GetOatMethod(class_method_index - 1);
+            const art::OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
+
+            if (method_header != nullptr && method_header->GetCodeSize() > 0) {
+              const uint8_t* code = method_header->GetCode();
+              uint32_t code_size = method_header->GetCodeSize();
+              if (args_->show_hex_dumps_) {
+                art::PrintHexDump(code, code_size, "Fixed", 64);
+              }
+              if (args_->show_disasm_) {
+                art::DisassembleWithObjdump(code, code_size, "Fixed");
+              }
+            } else {
+              std::cout << "  (no compiled code)\n";
+            }
+            if (args_->show_dex_instructions_) {
+              art::PrintDexBytecode(dex_file.get(), class_def_index, method.GetIndex());
+            }
+            std::cout << "\n";
+          }
+        }
+      }
+      if (!found) {
+        std::cout << "Method not found: " << args_->method_filter_ << "\n";
+      }
+      return true;
+    }
+
     // Code comparison mode
     if (args_->compare_code_) {
       if (original_oat_path.empty()) {
@@ -777,6 +868,10 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
         size_t count = 0;
         for (const auto& diff : result.GetDifferences()) {
           if (diff.status == art::CodeDifference::Status::kIdentical) {
+            continue;
+          }
+          if (args_->method_filter_ != nullptr &&
+              !art::MethodMatchesFilter(diff.class_name, diff.method_name, args_->method_filter_)) {
             continue;
           }
           if (count++ >= args_->max_diffs_) {
@@ -845,7 +940,7 @@ struct TestFixValidationMain : public art::CmdlineMain<TestFixValidationArgs> {
         }
       }
 
-      return true; 
+      return true;
     }
 
     // If comparing with original, check that disabled methods changed from non-zero to zero
@@ -953,4 +1048,7 @@ python3 oatcheck/test_fix_validation_host.py \
   --fixed-oat=/ssd2/wyz/app_oats/15.0.0_r5/com.tencent.mm/oat/base.odex \
   --original-oat=/ssd2/wyz/app_oats/15.0.0_r3/com.tencent.mm/oat/base.odex \
   --compare-code
+
+python3 oatcheck/test_fix_validation_host.py --fixed-oat=/ssd2/wyz/app_oats/15.0.0_r5/com.qiyi.video/oat/base.odex\
+  --method="Lcom/tencent/shadow/core/runtime/container/GeneratedPluginContainerAppCompatActivity;->onMenuOpened"
 */

@@ -275,6 +275,119 @@ class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge
       graph_.add_edge(from_vertex_id, to_vertex_id, DependencyGraphEdge(deps));
     }
   }
+
+  // Dump all successor nodes of a given class descriptor
+  // Edge direction: class -> method (method depends on class)
+  // Successors are nodes that the given class points to (i.e., methods depending on this class)
+  void DumpSuccessors(const std::string& class_descriptor) const {
+    LOG(INFO) << "=== Successors of " << class_descriptor << " ===";
+    size_t count = 0;
+    for (const auto& [vertex_id, vertex] : graph_.get_vertices()) {
+      if (vertex.GetDescriptor() == class_descriptor) {
+        auto successors = graph_.get_neighbors(vertex_id);
+        LOG(INFO) << "Found " << successors.size() << " successor(s)";
+        for (graaf::vertex_id_t succ_id : successors) {
+          const auto& succ_vertex = graph_.get_vertex(succ_id);
+          LOG(INFO) << "  -> " << succ_vertex.GetDescriptor();
+          count++;
+          if (count >= 10000) {
+            LOG(INFO) << "  (truncated at 10000)";
+            break;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  // Dump all ancestor nodes of a given descriptor (class or method)
+  // Edge direction: class -> method (method depends on class)
+  // Ancestors are nodes that the given node depends on (predecessors in the graph)
+  // Uses reverse adjacency: find all successors in the reversed graph.
+  void DumpAncestors(const std::string& target_descriptor) const {
+    LOG(INFO) << "=== Ancestors of " << target_descriptor << " ===";
+
+    // First, try exact match
+    graaf::vertex_id_t target_id = 0;
+    bool found = false;
+    for (const auto& [vertex_id, vertex] : graph_.get_vertices()) {
+      if (vertex.GetDescriptor() == target_descriptor) {
+        target_id = vertex_id;
+        found = true;
+        break;
+      }
+    }
+
+    // If not found exact, try prefix match and print all matches for debugging
+    if (!found) {
+      LOG(INFO) << "Exact match not found, checking prefix: " << target_descriptor;
+      for (const auto& [vertex_id, vertex] : graph_.get_vertices()) {
+        if (android::base::StartsWith(vertex.GetDescriptor(), target_descriptor)) {
+          LOG(INFO) << "  Prefix match: " << vertex.GetDescriptor();
+        }
+      }
+      LOG(INFO) << "Target node not found: " << target_descriptor;
+      return;
+    }
+
+    // Build reverse adjacency map (predecessors of each node)
+    std::unordered_map<graaf::vertex_id_t, std::vector<graaf::vertex_id_t>> reverse_adj;
+    for (const auto& [from_id, from_node] : graph_.get_vertices()) {
+      auto successors = graph_.get_neighbors(from_id);
+      for (graaf::vertex_id_t to_id : successors) {
+        reverse_adj[to_id].push_back(from_id);
+      }
+    }
+
+    // BFS on reversed graph to find all ancestors
+    std::unordered_set<graaf::vertex_id_t> visited;
+    std::queue<graaf::vertex_id_t> to_visit;
+    std::vector<graaf::vertex_id_t> ancestry_order;
+
+    to_visit.push(target_id);
+    visited.insert(target_id);
+
+    while (!to_visit.empty()) {
+      graaf::vertex_id_t current_id = to_visit.front();
+      to_visit.pop();
+      ancestry_order.push_back(current_id);
+
+      // Get all predecessors (ancestors) using reverse adjacency
+      auto it = reverse_adj.find(current_id);
+      if (it != reverse_adj.end()) {
+        for (graaf::vertex_id_t pred_id : it->second) {
+          if (visited.find(pred_id) == visited.end()) {
+            visited.insert(pred_id);
+            to_visit.push(pred_id);
+          }
+        }
+      }
+    }
+
+    LOG(INFO) << "Found " << (ancestry_order.size() - 1) << " ancestor(s) (excluding target)";
+
+    // Print ancestors in reverse traversal order (closest first)
+    size_t start_idx = 0;
+    if (!ancestry_order.empty() && ancestry_order[0] == target_id) {
+      start_idx = 1;
+    }
+
+    size_t count = 0;
+    for (size_t i = ancestry_order.size(); i > start_idx; --i) {
+      graaf::vertex_id_t ancestor_id = ancestry_order[i - 1];
+      if (ancestor_id == target_id) {
+        continue;
+      }
+      const auto& ancestor_vertex = graph_.get_vertex(ancestor_id);
+      LOG(INFO) << "  <- " << ancestor_vertex.GetDescriptor();
+      count++;
+      if (count >= 10000) {
+        LOG(INFO) << "  (truncated at 10000)";
+        break;
+      }
+    }
+  }
+
  private:
   friend class DependencyGraphBuilder;
   friend class DependencyGraphPropagator;
@@ -518,6 +631,7 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
       }
       i++;
     }
+    descriptor_to_symid_.find("Lcom/tencent/mm/plugin/remittance/ui/f7");
     // Step 2: Analyze classes and methods using the mapping
     i = 0;
     for (const auto& dex : dex_files_) {
@@ -590,12 +704,10 @@ class DependencyGraphBuilder : public DependencyGraphBuilderBase {
         }
 
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
-        //std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        std::string method_name(android::base::StringPrintf("d%zum%u", dex_file_idx,count));
+        std::string method_name(dex->PrettyMethod(method.GetIndex()));
+        //std::string method_name(dex->GetMethodNameView(method.GetIndex()));
         DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
         graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
-        //if (count++ > 50000) // TODO: remove me
-          //return true;
         for (auto it = code.begin(); it != code.end(); it++) {
           DexInstructionPcPair inst = *it;
           if (IsInstructionInvoke(inst->Opcode())) {
@@ -911,6 +1023,25 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       LOG(INFO) << "Printed " << printed_count << " interface changes (first 10 of " << interface_method_diffs_.size() << " total)";
     }
 
+    size_t printed_class_count = 0;
+    for (const auto& [class_desc, changes] : changed_class_info_) {
+      LOG(INFO) << "=== BCP Class Change #" << (printed_class_count + 1) << " ===";
+      LOG(INFO) << "Class: " << class_desc;
+      if (changes.test(static_cast<size_t>(DependencyType::kStaticFieldLayout))) {
+        LOG(INFO) << "  [STATIC FIELD LAYOUT CHANGED]";
+      }
+      if (changes.test(static_cast<size_t>(DependencyType::kInstanceFieldLayout))) {
+        LOG(INFO) << "  [INSTANCE FIELD LAYOUT CHANGED]";
+      }
+      if (changes.test(static_cast<size_t>(DependencyType::kVirtualTableLayout))) {
+        LOG(INFO) << "  [VIRTUAL TABLE LAYOUT CHANGED]";
+      }
+      printed_class_count++;
+    }
+    if (!changed_class_info_.empty()) {
+      LOG(INFO) << "Printed " << printed_class_count << " class changes (first 20 of " << changed_class_info_.size() << " total)";
+    }
+
     LOG(INFO) << "Found " << initial_changed_class_counter << "(s) initial changed classes";
     LOG(INFO) << "Found " << interface_method_changes_counter << "(s) interface method changes";
   }
@@ -1011,7 +1142,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     //  b. if number of virtual methods stay the same, then any of new virtual method doesnt match corresponding old instance field
 
     static int changed_class_count = 0;
-    const int kMaxPrintedChanges = 0;
+    const int kMaxPrintedChanges = 5;
 
     DependencyGraphNode& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
 
@@ -1021,7 +1152,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       const auto& field_id = accessor.GetDexFile().GetFieldId(field.GetIndex());
       const char* name = accessor.GetDexFile().GetFieldName(field_id);
       const char* type = accessor.GetDexFile().GetFieldTypeDescriptor(field_id);
-      return std::string(name) + ":" + std::string(type);
+      return std::to_string(field.GetIndex()) + ":" + std::string(name) + ":" + std::string(type);
     };
 
     // Helper to convert method to string representation
@@ -1086,7 +1217,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         const char* new_name = new_class_accessor.GetDexFile().GetFieldName(new_field_id);
         const char* old_type = old_class_accessor.GetDexFile().GetFieldTypeDescriptor(old_field_id);
         const char* new_type = new_class_accessor.GetDexFile().GetFieldTypeDescriptor(new_field_id);
-        if (strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
+        if (old_it->GetIndex() != new_it->GetIndex() || strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
           static_fields_changed = true;
           break;
         }
@@ -1114,7 +1245,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         const char* new_name = new_class_accessor.GetDexFile().GetFieldName(new_field_id);
         const char* old_type = old_class_accessor.GetDexFile().GetFieldTypeDescriptor(old_field_id);
         const char* new_type = new_class_accessor.GetDexFile().GetFieldTypeDescriptor(new_field_id);
-        if (strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
+        if (old_it->GetIndex() != new_it->GetIndex() ||strcmp(old_name, new_name) != 0 || strcmp(old_type, new_type) != 0) {
           instance_fields_changed = true;
           break;
         }
@@ -1142,7 +1273,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         const char* new_name = new_class_accessor.GetDexFile().GetMethodName(new_method_id);
         const Signature old_signature = old_class_accessor.GetDexFile().GetMethodSignature(old_method_id);
         const Signature new_signature = new_class_accessor.GetDexFile().GetMethodSignature(new_method_id);
-        if (strcmp(old_name, new_name) != 0 || old_signature != new_signature) {
+        if (old_it->GetIndex() != new_it->GetIndex() ||strcmp(old_name, new_name) != 0 || old_signature != new_signature) {
           vtable_changed = true;
           break;
         }
@@ -1154,7 +1285,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
     // Print debug info for first kMaxPrintedChanges changed classes
     if (static_fields_changed || instance_fields_changed || vtable_changed) {
-      if (changed_class_count < kMaxPrintedChanges) {
+      if (changed_class_count < kMaxPrintedChanges || vertex.GetDescriptor() == "Landroid/view/View;") {
         changed_class_count++;
         const std::string& class_descriptor = vertex.GetDescriptor();
         LOG(INFO) << "=== Class Change #" << changed_class_count << " ===";
@@ -1848,6 +1979,10 @@ struct OatCheckArgs : public CmdlineArgs {
       updated_bcp_prefix_ = raw_option + strlen("--updated-bcp-prefix=");
     } else if (option == "--fix") {
       fix_ = true;
+    } else if (option.starts_with("--dump-successors=")) {
+      dump_successors_ = raw_option + strlen("--dump-successors=");
+    } else if (option.starts_with("--dump-ancestors=")) {
+      dump_ancestors_ = raw_option + strlen("--dump-ancestors=");
     }
     // TODO: Add more options.
 
@@ -1908,6 +2043,8 @@ Options:
   --output=<file>               Write result to file (default: stdout)
   --verbose, -v                 Enable verbose logging
   --fix                         Disable invalidated methods and output fixed OAT file
+  --dump-successors=<class>    Dump all successor nodes of the given class descriptor
+  --dump-ancestors=<class>     Dump all ancestor nodes of the given class descriptor
   --help, -h                    Show this message
 )";
   }
@@ -1916,6 +2053,8 @@ Options:
   bool help_ = false;
   bool verbose_ = false;
   bool fix_ = false;
+  const char* dump_successors_ = nullptr;
+  const char* dump_ancestors_ = nullptr;
   std::vector<const char*> dex_files_;
   const char* oat_file_ = nullptr;
   const char* output_file_ = nullptr;
@@ -2140,6 +2279,16 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       graph = std::move(expanded_graph);
       LOG(INFO) << "Dependency graph after expansion: " << graph.Summary();
 
+      // Dump successors if requested
+      if (args_->dump_successors_ != nullptr) {
+        graph.DumpSuccessors(args_->dump_successors_);
+      }
+
+      // Dump ancestors if requested
+      if (args_->dump_ancestors_ != nullptr) {
+        graph.DumpAncestors(args_->dump_ancestors_);
+      }
+
       // Propagate changes through the expanded dependency graph to get AOT-invalidated methods
       if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
         LOG(INFO) << "Setting initial changes from BCP diff on expanded dependency graph...";
@@ -2150,28 +2299,49 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         propagator.PropagateChanges();
         LOG(INFO) << "Change propagation complete";
 
-        // Collect AOT-invalidated methods
+        // Collect AOT-invalidated methods and affected classes
         size_t aot_invalidated_methods = 0;
+        size_t aot_affected_classes = 0;
+        std::vector<std::string> aot_invalidated_method_names;
+        std::vector<std::pair<std::string, std::bitset<3>>> affected_class_details;
         for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
           if (vertex.IsChanged()) {
             DexSymId sym_id(vertex_id);
             if (!sym_id.IsClass()) {
               aot_invalidated_methods++;
-              if (args_->verbose_) {
-                LOG(INFO) << "AOT invalidated method: " << vertex.GetDescriptor();
-              }
+              aot_invalidated_method_names.push_back(vertex.GetDescriptor());
+            } else {
+              aot_affected_classes++;
+              affected_class_details.push_back({vertex.GetDescriptor(), vertex.GetChanges()});
             }
           }
+        }
+
+        size_t printed_class_count = 0;
+        //for (const auto& [class_desc, changes] : affected_class_details) {
+          //LOG(INFO) << "=== APP Affected Class #" << (printed_class_count + 1) << " ===";
+          ////LOG(INFO) << "Class: " << class_desc;
+          //printed_class_count++;
+        //}
+        if (!affected_class_details.empty()) {
+          LOG(INFO) << "Printed " << printed_class_count << " affected APP classes (first 20 of " << affected_class_details.size() << " total)";
         }
 
         *os << "\n=== Compiled Method Count ===\n";
         *os << "Total compiled methods: " << compiled_methods->size() << "\n";
 
         *os << "\n=== AOT Invalidation Detection Results ===\n";
+        *os << "Total AOT-affected classes: " << aot_affected_classes << "\n";
         *os << "Total AOT-invalidated methods: " << aot_invalidated_methods << "\n";
         // Statistics: interface vs class layout affected methods
         *os << "  (Interface method changes: " << g_interface_affected_methods << ")\n";
         *os << "  (Class layout changes: " << (aot_invalidated_methods - g_interface_affected_methods) << ")\n";
+
+        // Print all invalidated method names
+        *os << "\n=== AOT-Invalidated Methods ===\n";
+        for (const auto& method_name : aot_invalidated_method_names) {
+          *os << method_name << "\n";
+        }
 
         // If --fix is enabled, disable the invalidated methods in the OAT file
         if (args_->fix_ && aot_invalidated_methods > 0 && args_->oat_file_ != nullptr) {

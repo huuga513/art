@@ -39,6 +39,7 @@
 #include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 #include "dex/dex_file_structs.h"
+#include "dex/dex_file_types.h"
 #include "dex/dex_instruction-inl.h"
 #include "dex/dex_instruction.h"
 #include "dex/dex_instruction_iterator.h"
@@ -52,11 +53,12 @@
 #include "oat/oat_file-inl.h"
 #include "oat/oat_quick_method_header.h"
 #include "oat/stack_map.h"
+#include "optimizing/nodes.h"
 #include "runtime-inl.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
 #include "scoped_thread_state_change-inl.h"
-namespace art {
+using namespace art;
 enum class DependencyType {
   kStaticFieldLayout,
   kInstanceFieldLayout,
@@ -89,6 +91,9 @@ struct InterfaceMethodDiff {
 // Interface method change: independent change tracking for invoke-interface
 // Key: interface_descriptor, Value: set of "method_name:signature" that changed
 using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_set<std::string>>;
+
+// String ID changes: set of string contents whose IDs changed between old and new BCP
+using StringIdChanges = std::unordered_set<std::string>;
 
 // Global counters for statistics (will be removed later)
 static size_t g_interface_affected_methods = 0;
@@ -589,6 +594,8 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
   DependencyGraph* graph_ = nullptr;
   // Interface method changes from BCP diff: interface_descriptor -> set of changed method keys
   const InterfaceMethodChanges* interface_method_changes_ = nullptr;
+  // String ID changes from BCP diff: set of string contents whose IDs changed
+  const StringIdChanges* string_id_changes_ = nullptr;
 
  private:
   // Common AnalyzeDexMethods implementation
@@ -698,10 +705,19 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
                 class_dex_sym_id,
                 method_dex_sym_id,
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
+          } else if (inst->Opcode() == Instruction::CONST_STRING || inst->Opcode() == Instruction::CONST_STRING_JUMBO) {
+            auto string_idx = inst->VRegB();
+            const dex::StringId& str_id = dex->GetStringId(dex::StringIndex(string_idx));
+            const char* string_data = dex->GetStringData(str_id);
+            if (string_id_changes_ != nullptr && string_id_changes_->find(string_data) != string_id_changes_->end()) {
+              graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+              auto& vertex = graph_->graph_.get_vertex(vertex_id);
+              vertex.SetChange();
+            }
           }
-        }
       }
     }
+  }
     return true;
   }
 };
@@ -845,11 +861,13 @@ class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
   DependencyGraphBuilder(const char* apk_file_path,
                          DependencyGraph* graph,
                          const InterfaceMethodChanges* interface_method_changes = nullptr,
+                         const StringIdChanges* string_id_changes = nullptr,
                          const CompiledMethodSet* compiled_methods = nullptr)
       : apk_file_path_(apk_file_path),
         compiled_methods_(compiled_methods) {
     graph_ = graph;
     interface_method_changes_ = interface_method_changes;
+    string_id_changes_ = string_id_changes;
   }
 
   bool ExtractDex(std::string* error_msg) override {
@@ -1030,11 +1048,27 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     for (size_t i = 0; i < size; ++i) {
       auto& origin_dex = (*origin_dexs)[i];
       auto& updated_dex = updated_boot_dex_files_[i];
-      // for string ids in range(0,origin dex string id count)
-      // if origin dex->get string(id) not eq updated dex string(id)
-      // changed dex string add: dex id,string id
+      uint32_t origin_str_count = origin_dex->NumStringIds();
+      LOG(INFO) << "string count:" << origin_str_count;
+      // String IDs are sorted by string contents in dex files.
+      // Compare strings at the same index - if they differ, then all strings
+      // from this index onwards have different IDs (since ordering is different).
+      for (uint32_t str_idx = 0; str_idx < origin_str_count; ++str_idx) {
+        const char* origin_str = origin_dex->GetStringData(origin_dex->GetStringId(dex::StringIndex(str_idx)));
+        const char* new_str = updated_dex->GetStringData(updated_dex->GetStringId(dex::StringIndex(str_idx)));
+        if (strcmp(origin_str, new_str) != 0) {
+          // String at this index differs - this string and all subsequent strings have changed IDs
+          // Add all remaining strings from this position
+          LOG(INFO) << "first diff:" << str_idx;
+          for (uint32_t remaining_idx = str_idx; remaining_idx < origin_str_count; ++remaining_idx) {
+            const char* remaining_str = origin_dex->GetStringData(origin_dex->GetStringId(dex::StringIndex(remaining_idx)));
+            string_id_changes_.insert(std::string(remaining_str));
+          }
+          break;  // No need to check further, all remaining strings are already added
+        }
+      }
     }
-    // return changed dex string
+    LOG(INFO) << "Found " << string_id_changes_.size() << " string ID changes";
   }
   // IMPLEMENT ME:
   void MarkStringIdChanges() {
@@ -1046,6 +1080,10 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   // Getter for interface method changes (used by app dependency graph builder)
   // Move the ownership out since bcp_propagator will be destroyed after this
   InterfaceMethodChanges GetInterfaceMethodChanges() { return std::move(interface_method_changes_); }
+
+  // Getter for string ID changes (used by app dependency graph builder)
+  StringIdChanges GetStringIdChanges() { return std::move(string_id_changes_); }
+
   void SetInitialChanges() override {
     size_t initial_changed_class_counter = 0;
     size_t interface_method_changes_counter = 0;
@@ -1450,6 +1488,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
   // Interface method changes: interface_descriptor -> set of changed method keys
   InterfaceMethodChanges interface_method_changes_;
+
+  // String ID changes: set of string contents whose IDs changed between old and new BCP
+  StringIdChanges string_id_changes_;
 
   // Detailed interface method diffs: interface_descriptor -> detailed diff (for printing)
   std::map<std::string, InterfaceMethodDiff> interface_method_diffs_;
@@ -2345,6 +2386,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     // BCP change detection flow - run first to get interface method changes
     // Use a local variable instead of pointer to avoid dangling reference
     InterfaceMethodChanges interface_method_changes;
+    StringIdChanges string_id_changes;
 
     // Changed class info for app dependency graph - populated when BCP diff is enabled
     std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info;
@@ -2414,9 +2456,15 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Collect all changed classes after propagation (including indirect changes)
       bcp_propagator.CollectChangedClassInfoAfterPropagation();
 
+      // Compute string ID changes between old and new BCP
+      bcp_propagator.ComputeStringIdChanges();
+
       // Get interface method changes for app dependency graph
       // Move ownership to avoid dangling pointer after bcp_propagator is destroyed
       interface_method_changes = bcp_propagator.GetInterfaceMethodChanges();
+
+      // Get string ID changes for app dependency graph
+      string_id_changes = bcp_propagator.GetStringIdChanges();
 
       // Get changed class info for app dependency graph propagation
       changed_class_info = bcp_propagator.GetChangedClassInfo();
@@ -2459,7 +2507,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
     DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, &interface_method_changes,
-                                          compiled_methods);
+                                          &string_id_changes, compiled_methods);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
@@ -2475,7 +2523,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Rebuild graph with compiled method filtering
       DependencyGraph graph2;
       DependencyGraphBuilder graph_builder2(args_->apk_file_, &graph2, &interface_method_changes,
-                                             compiled_methods);
+                                             &string_id_changes, compiled_methods);
       if (!graph_builder2.BuildGraph(&error_msg)) {
         LOG(ERROR) << error_msg;
         return false;
@@ -2571,9 +2619,9 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
           if (vertex.IsChanged()) {
             DexSymId sym_id(vertex_id);
             if (!sym_id.IsClass()) {
-              aot_invalidated_methods++;
               const std::string& method_name = vertex.GetDescriptor();
-              //if (compiled_methods->find({sym_id.GetDexFileIndex(), sym_id.GetClassDefId(), sym_id.GetMethodDefId()}) == compiled_methods->end()) continue;
+              if (compiled_methods->find({sym_id.GetDexFileIndex(), sym_id.GetClassDefId(), sym_id.GetMethodDefId()}) == compiled_methods->end()) continue;
+              aot_invalidated_methods++;
               aot_invalidated_method_names.push_back(vertex.GetDescriptor());
             } else {
               aot_affected_classes++;
@@ -2607,59 +2655,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         for (const auto& method_name : aot_invalidated_method_names) {
           *os << method_name << "\n";
         }
-
-        // If --fix is enabled, disable the invalidated methods in the OAT file
-        if (args_->fix_ && aot_invalidated_methods > 0 && args_->oat_file_ != nullptr) {
-          LOG(INFO) << "Creating fixed OAT file...";
-
-          std::string fix_error_msg;
-          OatFilePatcher patcher(args_->oat_file_);
-
-          // Load OAT file info to get method offsets
-          if (!patcher.LoadOatFileInfo(&fix_error_msg)) {
-            LOG(ERROR) << "Failed to load OAT file info: " << fix_error_msg;
-          } else {
-            // Disable each invalidated method
-            for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
-              if (vertex.IsChanged()) {
-                DexSymId sym_id(vertex_id);
-                if (!sym_id.IsClass()) {
-                  // This is a method, disable it
-                  uint32_t dex_file_idx = sym_id.GetDexFileIndex();
-                  uint16_t class_def_idx = sym_id.GetClassDefId();
-                  uint32_t method_idx = sym_id.GetMethodDefId();
-                  patcher.DisableMethod(dex_file_idx, class_def_idx, method_idx);
-                }
-              }
-            }
-
-            // Generate output file name: original.oat -> original.oatfixed
-            // Note: Using .oatfixed instead of .oat.fixed so that GetVdexFilename
-            // correctly derives the vdex filename as original.vdex instead of original.oat.vdex
-            std::string output_path = std::string(args_->oat_file_) + "fixed";
-
-            if (patcher.SaveToFile(output_path, &fix_error_msg)) {
-              *os << "\n=== Fixed OAT File ===\n";
-              *os << "Output: " << output_path << "\n";
-              *os << "Disabled methods: " << patcher.GetDisabledCount() << "\n";
-            } else {
-              LOG(ERROR) << "Failed to save fixed OAT file: " << fix_error_msg;
-            }
-          }
-        }
       }
-    }
-
-    if (args_->output_file_ != nullptr) {
-      LOG(WARNING) << "--output not implemented yet; using stdout";
-    }
-
-    std::cout << "Running OatCheck...\n";
-
-    // Process explicit --dex files
-    for (const char* dex : args_->dex_files_) {
-      std::cout << "Processing DEX: " << dex << "\n";
-      // TODO: Add real validation logic here.
     }
 
     if (args_->oat_file_)
@@ -2674,10 +2670,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
   }
 };
 
-}  // namespace art
-
 int main(int argc, char** argv) {
   android::base::SetLogger(android::base::StderrLogger);
-  art::OatCheckMain main_runner;
+  OatCheckMain main_runner;
   return main_runner.Main(argc, argv);
 }

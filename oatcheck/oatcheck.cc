@@ -416,6 +416,10 @@ class BcpDependencyGraph : public DependencyGraph {
     dex_files_ = dex_files;
   }
 
+  const auto& GetDexFiles() const {
+    return dex_files_;
+  }
+
   // Construct ClassAccessor from DexSymId
   // DexSymId encodes: dex_file_index in high bits, class_def_index in low bits
   art::ClassAccessor GetClassAccessor(const DexSymId& dex_sym_id) const {
@@ -867,18 +871,19 @@ class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
     return true;
   }
 
-  bool ShouldProcessMethod(size_t dex_file_idx,
-                           uint16_t class_def_index,
-                           uint32_t method_index) override {
-    if (compiled_methods_ == nullptr || compiled_methods_->empty()) {
-      return true;
-    }
-    return compiled_methods_->find({dex_file_idx, class_def_index, method_index}) != compiled_methods_->end();
+  bool ShouldProcessMethod(ATTRIBUTE_UNUSED size_t dex_file_idx,
+                           ATTRIBUTE_UNUSED uint16_t class_def_index,
+                           ATTRIBUTE_UNUSED uint32_t method_index) override {
+    return true;
+    //if (compiled_methods_ == nullptr || compiled_methods_->empty()) {
+      //return true;
+    //}
+    //return compiled_methods_->find({dex_file_idx, class_def_index, method_index}) != compiled_methods_->end();
   }
 
  private:
   const char* apk_file_path_ = nullptr;
-  const CompiledMethodSet* compiled_methods_ = nullptr;
+  ATTRIBUTE_UNUSED const CompiledMethodSet* compiled_methods_ = nullptr;
 };
 
 class DependencyGraphPropagator {
@@ -1018,6 +1023,24 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       }
     }
   }
+  void ComputeStringIdChanges() {
+    auto& origin_dexs = bcp_graph_.GetDexFiles();
+    CHECK(origin_dexs->size() == updated_boot_dex_files_.size());
+    size_t size = origin_dexs->size();
+    for (size_t i = 0; i < size; ++i) {
+      auto& origin_dex = (*origin_dexs)[i];
+      auto& updated_dex = updated_boot_dex_files_[i];
+      // for string ids in range(0,origin dex string id count)
+      // if origin dex->get string(id) not eq updated dex string(id)
+      // changed dex string add: dex id,string id
+    }
+    // return changed dex string
+  }
+  // IMPLEMENT ME:
+  void MarkStringIdChanges() {
+    // for all methods in 
+  }
+
 
 
   // Getter for interface method changes (used by app dependency graph builder)
@@ -2549,6 +2572,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
             DexSymId sym_id(vertex_id);
             if (!sym_id.IsClass()) {
               aot_invalidated_methods++;
+              const std::string& method_name = vertex.GetDescriptor();
+              //if (compiled_methods->find({sym_id.GetDexFileIndex(), sym_id.GetClassDefId(), sym_id.GetMethodDefId()}) == compiled_methods->end()) continue;
               aot_invalidated_method_names.push_back(vertex.GetDescriptor());
             } else {
               aot_affected_classes++;

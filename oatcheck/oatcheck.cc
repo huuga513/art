@@ -809,10 +809,12 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods
  public:
   BcpMethodDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths,
                                  DependencyGraph* graph,
-                                 const InterfaceMethodChanges* interface_method_changes = nullptr)
+                                 const InterfaceMethodChanges* interface_method_changes = nullptr,
+                                 StringIdChanges* string_id_changes = nullptr)
       : jar_file_paths_(jar_file_paths) {
     graph_ = graph;
     interface_method_changes_ = interface_method_changes;
+    string_id_changes_ = string_id_changes;
   }
 
   bool ExtractDex(std::string* error_msg) override {
@@ -1614,7 +1616,7 @@ class BcpMethodDependencyGraphPropagator {
     }
 
     LOG(INFO) << "Collected " << collected << " affected BCP methods after propagation";
-    for (auto x:affected_methods) LOG(INFO) << "BCP invalid method:" << bcp_method_graph_.graph_.get_vertex(x.id).GetDescriptor();
+    //for (auto x:affected_methods) LOG(INFO) << "BCP invalid method:" << bcp_method_graph_.graph_.get_vertex(x.id).GetDescriptor();
     return affected_methods;
   }
 
@@ -2523,7 +2525,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Rebuild graph with compiled method filtering
       DependencyGraph graph2;
       DependencyGraphBuilder graph_builder2(args_->apk_file_, &graph2, &interface_method_changes,
-                                             &string_id_changes, compiled_methods);
+                                             nullptr, compiled_methods); //modified
       if (!graph_builder2.BuildGraph(&error_msg)) {
         LOG(ERROR) << error_msg;
         return false;
@@ -2591,7 +2593,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
         // Use heap allocation to reduce stack usage
         std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
-        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get(), &interface_method_changes);
+        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get(), &interface_method_changes, &string_id_changes);
         if (!bcp_method_builder.BuildGraph(&error_msg)) {
           LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
           return false;

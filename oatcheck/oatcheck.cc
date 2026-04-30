@@ -17,6 +17,7 @@
 #include <bitset>
 #include <cstddef>
 #include <map>
+#include <memory>
 #include <set>
 #include <cstdint>
 #include <cstdio>
@@ -59,6 +60,46 @@
 #include "scoped_thread_state_change.h"
 #include "scoped_thread_state_change-inl.h"
 using namespace art;
+
+static void PrintDexBytecode(const DexFile* dex_file,
+                              uint16_t class_def_idx,
+                              uint32_t method_idx) {
+  if (dex_file == nullptr) {
+    std::cout << "  DEX code: (no dex file)\n";
+    return;
+  }
+
+  // Find the class
+  if (class_def_idx >= dex_file->NumClassDefs()) {
+    std::cout << "  DEX code: (class not found)\n";
+    return;
+  }
+
+  const dex::ClassDef& class_def = dex_file->GetClassDef(class_def_idx);
+  ClassAccessor accessor(*dex_file, class_def);
+
+  // Find the method within this class
+  for (ClassAccessor::Method method : accessor.GetMethods()) {
+    if (method.GetIndex() == method_idx) {
+      const dex::CodeItem* code_item = method.GetCodeItem();
+      if (code_item == nullptr) {
+        std::cout << "  DEX code: (native or abstract method)\n";
+        return;
+      }
+
+      std::cout << "  DEX code:\n";
+      CodeItemDataAccessor code_accessor(*dex_file, code_item);
+      for (const DexInstructionPcPair& pair : code_accessor) {
+        const uint32_t dex_pc = pair.DexPc();
+        const Instruction* insn = &pair.Inst();
+        std::string disasm = insn->DumpString(dex_file);
+        printf("    %04x: %s\n", dex_pc * 2, disasm.c_str());
+      }
+      return;
+    }
+  }
+  std::cout << "  DEX code: (method not found)\n";
+}
 enum class DependencyType {
   kStaticFieldLayout,
   kInstanceFieldLayout,
@@ -94,6 +135,9 @@ using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_se
 
 // String ID changes: set of string contents whose IDs changed between old and new BCP
 using StringIdChanges = std::unordered_set<std::string>;
+
+// Type ID changes: set of type descriptors whose type IDs changed between old and new BCP
+using TypeIdChanges = std::unordered_set<std::string>;
 
 // Global counters for statistics (will be removed later)
 static size_t g_interface_affected_methods = 0;
@@ -596,6 +640,8 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
   const InterfaceMethodChanges* interface_method_changes_ = nullptr;
   // String ID changes from BCP diff: set of string contents whose IDs changed
   const StringIdChanges* string_id_changes_ = nullptr;
+  // Type ID changes from BCP diff: set of type descriptors whose type IDs changed
+  const TypeIdChanges* type_id_changes_ = nullptr;
 
  private:
   // Common AnalyzeDexMethods implementation
@@ -610,6 +656,12 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
 
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         std::string method_name(dex->PrettyMethod(method.GetIndex()));
+        bool isonmeunopened=false;
+        if ((dex_file_idx == 6 && method.GetIndex() == 5469) || (dex_file_idx==5 && method.GetIndex() == 3597) || (dex_file_idx==7 && method.GetIndex() == 59095)) {
+          std::cout <<method_name<<"\n";
+          PrintDexBytecode(dex, class_def_index, method.GetIndex());
+          isonmeunopened = true;
+        }
         DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
         graph_->AddVertexIfAbsent(method_dex_sym_id, method_name, false);
 
@@ -635,6 +687,16 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
               case kDexInvokeSuper:
               case kDexInvokeDirect:
               case kDexInvokeStatic: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* class_descriptor = dex->GetStringData(name_id);
+                if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+                  graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+                  auto& vertex = graph_->graph_.get_vertex(vertex_id);
+                  vertex.SetChange();
+                }
                 break;
               }
               case kDexInvokeInterface: {
@@ -699,6 +761,11 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
+            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+              graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+              auto& vertex = graph_->graph_.get_vertex(vertex_id);
+              vertex.SetChange();
+            }
             DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
             graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
             graph_->UpdateEdge(
@@ -710,6 +777,27 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
             const dex::StringId& str_id = dex->GetStringId(dex::StringIndex(string_idx));
             const char* string_data = dex->GetStringData(str_id);
             if (string_id_changes_ != nullptr && string_id_changes_->find(string_data) != string_id_changes_->end()) {
+              graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+              auto& vertex = graph_->graph_.get_vertex(vertex_id);
+              vertex.SetChange();
+              if (isonmeunopened) LOG(INFO)<<"Aeeeee";
+            }
+          } else if (inst->Opcode() == Instruction::CONST_CLASS) {
+            auto type_idx = inst->VRegB();
+            const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+              graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+              auto& vertex = graph_->graph_.get_vertex(vertex_id);
+              vertex.SetChange();
+            }
+          } else if (inst->Opcode() == Instruction::NEW_INSTANCE) {
+            auto type_idx = inst->VRegB();
+            const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
@@ -810,11 +898,13 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods
   BcpMethodDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths,
                                  DependencyGraph* graph,
                                  const InterfaceMethodChanges* interface_method_changes = nullptr,
-                                 StringIdChanges* string_id_changes = nullptr)
+                                 StringIdChanges* string_id_changes = nullptr,
+                                 const TypeIdChanges* type_id_changes = nullptr)
       : jar_file_paths_(jar_file_paths) {
     graph_ = graph;
     interface_method_changes_ = interface_method_changes;
     string_id_changes_ = string_id_changes;
+    type_id_changes_ = type_id_changes;
   }
 
   bool ExtractDex(std::string* error_msg) override {
@@ -864,12 +954,14 @@ class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
                          DependencyGraph* graph,
                          const InterfaceMethodChanges* interface_method_changes = nullptr,
                          const StringIdChanges* string_id_changes = nullptr,
+                         const TypeIdChanges* type_id_changes = nullptr,
                          const CompiledMethodSet* compiled_methods = nullptr)
       : apk_file_path_(apk_file_path),
         compiled_methods_(compiled_methods) {
     graph_ = graph;
     interface_method_changes_ = interface_method_changes;
     string_id_changes_ = string_id_changes;
+    type_id_changes_ = type_id_changes;
   }
 
   bool ExtractDex(std::string* error_msg) override {
@@ -937,6 +1029,7 @@ class DependencyGraphPropagator {
         // This should be a class node, not a method node
         CHECK(dex_sym_id.IsClass()) << "SetInitialChangesFromBcp should not modify method nodes: "
                                         << class_descriptor;
+        CHECK(graph_vertex.GetChanges().none());
         graph_vertex.SetChanges(it->second);
         initial_changed_nodes++;
       }
@@ -1072,9 +1165,38 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     }
     LOG(INFO) << "Found " << string_id_changes_.size() << " string ID changes";
   }
+  void ComputeTypeIdChanges() {
+    auto& origin_dexs = bcp_graph_.GetDexFiles();
+    CHECK(origin_dexs->size() == updated_boot_dex_files_.size());
+    size_t size = origin_dexs->size();
+    for (size_t i = 0; i < size; ++i) {
+      auto& origin_dex = (*origin_dexs)[i];
+      auto& updated_dex = updated_boot_dex_files_[i];
+      uint32_t origin_type_count = origin_dex->NumTypeIds();
+      // Type IDs are sorted by string_id index.
+      // Compare type descriptors at the same index - if they differ, then all type IDs
+      // from this index onwards have different IDs (since ordering is different).
+      for (uint32_t type_idx = 0; type_idx < origin_type_count; ++type_idx) {
+        const dex::TypeId& origin_type_id = origin_dex->GetTypeId(dex::TypeIndex(type_idx));
+        const dex::TypeId& new_type_id = updated_dex->GetTypeId(dex::TypeIndex(type_idx));
+        const char* origin_desc = origin_dex->GetStringData(origin_dex->GetStringId(origin_type_id.descriptor_idx_));
+        const char* new_desc = updated_dex->GetStringData(updated_dex->GetStringId(new_type_id.descriptor_idx_));
+        if (strcmp(origin_desc, new_desc) != 0) {
+          // Type at this index differs - this type and all subsequent types have changed IDs
+          for (uint32_t remaining_idx = type_idx; remaining_idx < origin_type_count; ++remaining_idx) {
+            const dex::TypeId& remaining_type_id = origin_dex->GetTypeId(dex::TypeIndex(remaining_idx));
+            const char* remaining_desc = origin_dex->GetStringData(origin_dex->GetStringId(remaining_type_id.descriptor_idx_));
+            type_id_changes_.insert(std::string(remaining_desc));
+          }
+          break;
+        }
+      }
+    }
+    LOG(INFO) << "Found " << type_id_changes_.size() << " type ID changes";
+  }
   // IMPLEMENT ME:
   void MarkStringIdChanges() {
-    // for all methods in 
+    // for all methods in
   }
 
 
@@ -1085,6 +1207,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
   // Getter for string ID changes (used by app dependency graph builder)
   StringIdChanges GetStringIdChanges() { return std::move(string_id_changes_); }
+
+  // Getter for type ID changes (used by app dependency graph builder)
+  TypeIdChanges GetTypeIdChanges() { return std::move(type_id_changes_); }
 
   void SetInitialChanges() override {
     size_t initial_changed_class_counter = 0;
@@ -1494,6 +1619,9 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   // String ID changes: set of string contents whose IDs changed between old and new BCP
   StringIdChanges string_id_changes_;
 
+  // Type ID changes: set of type descriptors whose type IDs changed between old and new BCP
+  TypeIdChanges type_id_changes_;
+
   // Detailed interface method diffs: interface_descriptor -> detailed diff (for printing)
   std::map<std::string, InterfaceMethodDiff> interface_method_diffs_;
 
@@ -1611,6 +1739,7 @@ class BcpMethodDependencyGraphPropagator {
 
       if (vertex.IsChanged()) {
         affected_methods.push_back(dex_sym_id);
+        if (vertex.GetDescriptor().starts_with("boolean android.app.Activity.onMenuOpened")) LOG(INFO)<<"Beeeeee" << dex_sym_id.GetDexFileIndex() << ":" << dex_sym_id.GetMethodDefId();
         collected++;
       }
     }
@@ -2017,7 +2146,7 @@ class InlineDependencyExpander {
           const InlineCallGraphNode& vertex_b = inline_graph_.graph_.get_vertex(vertex_b_id);
           std::string method_name = vertex_b.GetDescriptor();
           expanded_graph->AddVertexIfAbsent(bcp_method_symid, method_name, false);  // is_changed=false
-          expanded_graph->UpdateEdge(bcp_method_symid, DexSymId(vertex_a_id), std::bitset<3>(true));
+          expanded_graph->UpdateEdge(bcp_method_symid, DexSymId(vertex_a_id), std::bitset<3>(7));
           // B has no predecessors in original graph, so no C → B edges to propagate
           // Skip to next B but don't count as skipped since we created the vertex
           continue;
@@ -2136,6 +2265,9 @@ class InlineCallGraphBuilder {
   }
   bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, uint16_t caller_class_def_idx, const DexSymId caller_dex_sym_id) {
     CodeInfo code_info(caller_header);
+    std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
+    bool isonme = false;
+    if (caller_method_name.starts_with("boolean com.tencent.shadow.core.runtime.container.PluginContainerAppCompatActivity.onMenuOpened")) isonme = true;
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
         MethodInfo method_info = code_info.GetMethodInfoOf(inline_info);
@@ -2144,7 +2276,7 @@ class InlineCallGraphBuilder {
         if (method_info.HasDexFileIndex()) {
           graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
           DexSymId callee_dex_sym_id(method_info.GetDexFileIndex(), caller_class_def_idx, method_info.GetMethodIndex());
-
+          if (isonme) LOG(INFO) << "Deee"<<callee_dex_sym_id.GetDexFileIndex() << ":" <<callee_dex_sym_id.GetMethodDefId();
           // Try to get method name
           std::string method_name;
           if (inline_info.EncodesArtMethod()) {
@@ -2370,25 +2502,11 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       LOG(WARNING) << "--output not implemented yet; using stdout";
     }
 
-    *os << "Running OatCheck...\n";
-
-    // Process explicit --dex files
-    for (const char* dex : args_->dex_files_) {
-      *os << "Processing DEX: " << dex << "\n";
-      // TODO: Add real validation logic here.
-    }
-
-    if (args_->oat_file_)
-      *os << "OAT: " << args_->oat_file_ << "\n";
-    if (args_->origin_bcp_prefix_)
-      *os << "Original BCP prefix: " << args_->origin_bcp_prefix_ << "\n";
-    if (args_->updated_bcp_prefix_)
-      *os << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
-
     // BCP change detection flow - run first to get interface method changes
     // Use a local variable instead of pointer to avoid dangling reference
     InterfaceMethodChanges interface_method_changes;
     StringIdChanges string_id_changes;
+    TypeIdChanges type_id_changes;
 
     // Changed class info for app dependency graph - populated when BCP diff is enabled
     std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info;
@@ -2413,13 +2531,13 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       }
 
       // Build original BCP dependency graph
-      BcpDependencyGraph original_bcp_graph;
-      BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, &original_bcp_graph);
+      std::unique_ptr<BcpDependencyGraph> original_bcp_graph = std::make_unique<BcpDependencyGraph>();
+      BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, original_bcp_graph.get());
       if (!bcp_builder.BuildGraph(&error_msg)) {
         LOG(ERROR) << "Failed to build original BCP dependency graph: " << error_msg;
         return false;
       }
-      LOG(INFO) << "Original BCP graph built: " << original_bcp_graph.Summary();
+      LOG(INFO) << "Original BCP graph built: " << original_bcp_graph->Summary();
 
       // Load updated BCP DEX files
       std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
@@ -2448,7 +2566,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       }
 
       // Run change detection and propagation
-      BcpDependencyGraphPropagator bcp_propagator(&original_bcp_graph, updated_boot_dex_files);
+      BcpDependencyGraphPropagator bcp_propagator(original_bcp_graph.get(), updated_boot_dex_files);
       LOG(INFO) << "Setting initial changes...";
       bcp_propagator.SetInitialChanges();
       LOG(INFO) << "Propagating changes";
@@ -2461,6 +2579,9 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Compute string ID changes between old and new BCP
       bcp_propagator.ComputeStringIdChanges();
 
+      // Compute type ID changes between old and new BCP
+      bcp_propagator.ComputeTypeIdChanges();
+
       // Get interface method changes for app dependency graph
       // Move ownership to avoid dangling pointer after bcp_propagator is destroyed
       interface_method_changes = bcp_propagator.GetInterfaceMethodChanges();
@@ -2468,13 +2589,20 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Get string ID changes for app dependency graph
       string_id_changes = bcp_propagator.GetStringIdChanges();
 
+      if (string_id_changes.find("Tried to open action bar menu with no action bar") != string_id_changes.end()) {
+        LOG(INFO) << "Ceeeeee";
+      }
+
+      // Get type ID changes for app dependency graph
+      type_id_changes = bcp_propagator.GetTypeIdChanges();
+
       // Get changed class info for app dependency graph propagation
       changed_class_info = bcp_propagator.GetChangedClassInfo();
 
       // Collect and report results
       size_t changed_classes = 0;
       size_t changed_methods = 0;
-      for (const auto& [vertex_id, vertex] : original_bcp_graph.GetVertices()) {
+      for (const auto& [vertex_id, vertex] : original_bcp_graph->GetVertices()) {
         if (vertex.IsChanged()) {
           DexSymId sym_id(vertex_id);
           if (!sym_id.IsClass()) {
@@ -2509,7 +2637,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
     DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, &interface_method_changes,
-                                          &string_id_changes, compiled_methods);
+                                          &string_id_changes, &type_id_changes, compiled_methods);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
@@ -2525,7 +2653,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Rebuild graph with compiled method filtering
       DependencyGraph graph2;
       DependencyGraphBuilder graph_builder2(args_->apk_file_, &graph2, &interface_method_changes,
-                                             nullptr, compiled_methods); //modified
+                                             nullptr, nullptr, compiled_methods); //modified
       if (!graph_builder2.BuildGraph(&error_msg)) {
         LOG(ERROR) << error_msg;
         return false;
@@ -2593,7 +2721,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
         // Use heap allocation to reduce stack usage
         std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
-        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get(), &interface_method_changes, &string_id_changes);
+        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get(), &interface_method_changes, &string_id_changes, &type_id_changes);
         if (!bcp_method_builder.BuildGraph(&error_msg)) {
           LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
           return false;

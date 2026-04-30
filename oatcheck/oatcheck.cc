@@ -535,6 +535,173 @@ class DependencyGraphBuilderBase {
   }
 };
 
+// Intermediate base class for builders that analyze methods (as opposed to just class dependencies).
+// Inherits from DependencyGraphBuilderBase and adds common method analysis logic.
+class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
+ public:
+  virtual ~DependencyGraphBuilderWithMethods() = default;
+
+  // Override point 1: Extract DEX files (JAR vs APK)
+  virtual bool ExtractDex(std::string* error_msg) = 0;
+
+  // Override point 2: Whether to process a given method (for compiled method filtering)
+  virtual bool ShouldProcessMethod(size_t dex_file_idx,
+                                   uint16_t class_def_index,
+                                   uint32_t method_index) = 0;
+
+  // Common BuildGraph implementation
+  bool BuildGraph(std::string* error_msg) override {
+    if (!ExtractDex(error_msg)) {
+      return false;
+    }
+
+    size_t i = 0;
+    // Step 1: Build descriptor -> DexSymId mapping for all dex files
+    for (const auto& dex : dex_files_) {
+      if (!BuildDescriptorMapping(dex.get(), i, graph_)) {
+        LOG(ERROR) << "Failed to build descriptor mapping: " << *error_msg;
+        return false;
+      }
+      i++;
+    }
+    // Step 2: Analyze classes and methods using the mapping
+    i = 0;
+    for (const auto& dex : dex_files_) {
+      if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
+        LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
+        return false;
+      }
+      if (!BuildDependencyEdges(dex.get(), i, graph_)) {
+        LOG(ERROR) << "Failed to build dependency edges: " << *error_msg;
+        return false;
+      }
+      i++;
+    }
+    LOG(INFO) << graph_->Summary();
+    return true;
+  }
+
+ protected:
+  DependencyGraph* graph_ = nullptr;
+  // Interface method changes from BCP diff: interface_descriptor -> set of changed method keys
+  const InterfaceMethodChanges* interface_method_changes_ = nullptr;
+
+ private:
+  // Common AnalyzeDexMethods implementation
+  bool AnalyzeDexMethods(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+    for (art::ClassAccessor accessor : dex->GetClasses()) {
+      uint16_t class_def_index = accessor.GetClassDefIndex();
+      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
+        // Check if method should be processed (filter by compiled status)
+        if (!ShouldProcessMethod(dex_file_idx, class_def_index, method.GetIndex())) {
+          continue;
+        }
+
+        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
+        std::string method_name(dex->PrettyMethod(method.GetIndex()));
+        DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
+        graph_->AddVertexIfAbsent(method_dex_sym_id, method_name, false);
+
+        for (auto it = code.begin(); it != code.end(); it++) {
+          DexInstructionPcPair inst = *it;
+          if (IsInstructionInvoke(inst->Opcode())) {
+            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
+            switch (invoke_type) {
+              case kDexInvokeVirtual: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* class_descriptor = dex->GetStringData(name_id);
+                DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+                graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+                graph_->UpdateEdge(
+                    class_dex_sym_id,
+                    method_dex_sym_id,
+                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
+                break;
+              }
+              case kDexInvokeSuper:
+              case kDexInvokeDirect:
+              case kDexInvokeStatic: {
+                break;
+              }
+              case kDexInvokeInterface: {
+                auto method_idx = inst->VRegB();
+                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
+                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
+                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+                const char* interface_descriptor = dex->GetStringData(name_id);
+
+                // Check if this is a boot classpath interface
+                if (!IsBootClasspathClass(interface_descriptor)) {
+                  break;
+                }
+
+                // Get method name and signature
+                const char* called_method_name = dex->GetMethodName(method_id);
+                Signature method_sig = dex->GetMethodSignature(method_id);
+                std::string method_key = std::string(called_method_name) + ":" + method_sig.ToString();
+
+                // Check if interface method changed and mark calling method as affected
+                if (interface_method_changes_ != nullptr) {
+                  auto interface_it = interface_method_changes_->find(interface_descriptor);
+                  if (interface_it != interface_method_changes_->end() &&
+                      interface_it->second.find(method_key) != interface_it->second.end()) {
+                    graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+                    auto& vertex = graph_->graph_.get_vertex(vertex_id);
+                    if (!vertex.IsChanged()) g_interface_affected_methods++;
+                    vertex.SetChange();
+                  }
+                }
+
+                // Create edge for interface dependency
+                DexSymId interface_dex_sym_id = GetOrCreateDexSymId(interface_descriptor);
+                graph_->AddVertexIfAbsent(interface_dex_sym_id, interface_descriptor, false);
+                graph_->UpdateEdge(
+                    interface_dex_sym_id,
+                    method_dex_sym_id,
+                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
+                break;
+              }
+              default: {
+                LOG(WARNING) << "Unknown invoke type at dex pc " << inst.DexPc()
+                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
+                break;
+              }
+            }
+          } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
+            auto field_idx = inst->VRegC();
+            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+            graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+            graph_->UpdateEdge(
+                class_dex_sym_id,
+                method_dex_sym_id,
+                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
+          } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
+            auto field_idx = inst->VRegB();
+            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
+            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+            graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
+            graph_->UpdateEdge(
+                class_dex_sym_id,
+                method_dex_sym_id,
+                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
+          }
+        }
+      }
+    }
+    return true;
+  }
+};
+
 class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
  public:
   BcpDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths, BcpDependencyGraph* bcp_graph)
@@ -618,51 +785,21 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
 // BCP method dependency graph builder - reuses DependencyGraphBuilder logic
 // but processes ALL BCP methods (not filtered by compiled methods)
-class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderBase {
+class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
  public:
   BcpMethodDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths,
-                                   DependencyGraph* graph)
-      : jar_file_paths_(jar_file_paths), graph_(*graph) {}
-
-  bool BuildGraph(std::string* error_msg) override {
-    if (!ExtractDexFromJars(error_msg)) {
-      return false;
-    }
-
-    size_t i = 0;
-    // Step 1: Build descriptor -> DexSymId mapping for all dex files
-    for (const auto& dex : dex_files_) {
-      if (!BuildDescriptorMapping(dex.get(), i, &graph_)) {
-        LOG(ERROR) << "Failed to build descriptor mapping: " << *error_msg;
-        return false;
-      }
-      i++;
-    }
-    // Step 2: Analyze classes and methods using the mapping
-    i = 0;
-    for (const auto& dex : dex_files_) {
-      if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
-        LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
-        return false;
-      }
-      if (!BuildDependencyEdges(dex.get(), i, &graph_)) {
-        LOG(ERROR) << "Failed to build dependency edges: " << *error_msg;
-        return false;
-      }
-      i++;
-    }
-    LOG(INFO) << "BCP method graph built: " << graph_.Summary();
-    return true;
+                                 DependencyGraph* graph,
+                                 const InterfaceMethodChanges* interface_method_changes = nullptr)
+      : jar_file_paths_(jar_file_paths) {
+    graph_ = graph;
+    interface_method_changes_ = interface_method_changes;
   }
 
- private:
-  // Extract all classes*.dex from all JAR files into `dex_files_`.
-  bool ExtractDexFromJars(std::string* error_msg) {
+  bool ExtractDex(std::string* error_msg) override {
     for (const char* jar_file_path : jar_file_paths_) {
       if (jar_file_path == nullptr) {
         continue;
       }
-
       art::DexFileLoader loader(jar_file_path, /*location=*/jar_file_path);
       std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
       bool success = loader.Open(
@@ -671,331 +808,77 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderBase {
           /*allow_no_dex_files=*/false,
           error_msg,
           &jar_dex_files);
-
       if (!success || jar_dex_files.empty()) {
         LOG(ERROR) << "Failed to load DEX from JAR " << jar_file_path << ": " << *error_msg;
         return false;
       }
-
       for (auto& dex : jar_dex_files) {
         dex_files_.push_back(std::move(dex));
       }
     }
-
     if (dex_files_.empty()) {
       *error_msg = "No DEX files loaded from any JAR files";
       return false;
     }
-
     return true;
   }
 
-  // Analyze method instructions and build method-level dependency edges.
-  // Processes ALL methods (no compiled_methods filtering).
-  bool AnalyzeDexMethods(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
-    for (art::ClassAccessor accessor : dex->GetClasses()) {
-      uint16_t class_def_index = accessor.GetClassDefIndex();
-      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
-        // Process all methods without filtering - no compiled_methods check
-
-        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
-        std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
-        graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
-
-        for (auto it = code.begin(); it != code.end(); it++) {
-          DexInstructionPcPair inst = *it;
-          if (IsInstructionInvoke(inst->Opcode())) {
-            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
-            switch (invoke_type) {
-              case kDexInvokeVirtual: {
-                auto method_idx = inst->VRegB();
-                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* class_descriptor = dex->GetStringData(name_id);
-                DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
-                graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-                graph_.UpdateEdge(
-                    class_dex_sym_id,
-                    method_dex_sym_id,
-                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
-                break;
-              }
-              case kDexInvokeSuper:
-              case kDexInvokeDirect:
-              case kDexInvokeStatic: {
-                break;
-              }
-              case kDexInvokeInterface: {
-                auto method_idx = inst->VRegB();
-                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* interface_descriptor = dex->GetStringData(name_id);
-
-                // Check if this is a boot classpath interface
-                if (!IsBootClasspathClass(interface_descriptor)) {
-                  break;
-                }
-
-                // For BCP->BCP interface calls, create edge if interface is BCP
-                DexSymId interface_dex_sym_id = GetOrCreateDexSymId(interface_descriptor);
-                graph_.AddVertexIfAbsent(interface_dex_sym_id, interface_descriptor, false);
-                graph_.UpdateEdge(
-                    interface_dex_sym_id,
-                    method_dex_sym_id,
-                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
-                break;
-              }
-              default:{
-                LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
-                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
-                break;
-              }
-            }
-          } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
-            auto field_idx = inst->VRegC();
-            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
-            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
-            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-            graph_.UpdateEdge(
-                class_dex_sym_id,
-                method_dex_sym_id,
-                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
-          } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
-            auto field_idx = inst->VRegB();
-            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
-            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
-            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-            graph_.UpdateEdge(
-                class_dex_sym_id,
-                method_dex_sym_id,
-                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
-          }
-        }
-      }
-    }
-    return true;
-  }
-
-  std::vector<const char*> jar_file_paths_;
-  DependencyGraph& graph_;
-};
-
-class DependencyGraphBuilder : public DependencyGraphBuilderBase {
- public:
-  // compiled_methods: set of (dex_file_idx, class_def_index, method_index) that have compiled code
-  using CompiledMethodSet = std::set<std::tuple<size_t, uint16_t, uint32_t>>;
-
-  DependencyGraphBuilder(const char* apk_file_path,
-                          DependencyGraph* graph,
-                          const InterfaceMethodChanges* interface_method_changes = nullptr,
-                          const CompiledMethodSet* compiled_methods = nullptr)
-      : interface_method_changes_(interface_method_changes),
-        apk_file_path_(apk_file_path),
-        graph_(*graph),
-        compiled_methods_(compiled_methods) {}
-
-  bool BuildGraph(std::string* error_msg) override {
-    g_interface_affected_methods = 0;
-    if (!ExtractDexFromApk(error_msg)) {
-      return false;
-    }
-    size_t i = 0;
-    // Step 1: Build descriptor -> DexSymId mapping for all dex files
-    for (const auto& dex : dex_files_) {
-      if (!BuildDescriptorMapping(dex.get(), i, &graph_)) {
-        LOG(ERROR) << "Failed to build descriptor mapping: " << *error_msg;
-        return false;
-      }
-      i++;
-    }
-    descriptor_to_symid_.find("Lcom/tencent/mm/plugin/remittance/ui/f7");
-    // Step 2: Analyze classes and methods using the mapping
-    i = 0;
-    for (const auto& dex : dex_files_) {
-      if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
-        LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
-        return false;
-      }
-      if (!BuildDependencyEdges(dex.get(), i, &graph_)) {
-        LOG(ERROR) << "Failed to build dependency edges: " << *error_msg;
-        return false;
-      }
-      i++;
-    }
-    LOG(INFO) << graph_.Summary();
+  // Process ALL methods (no filtering)
+  bool ShouldProcessMethod(ATTRIBUTE_UNUSED size_t dex_file_idx,
+                           ATTRIBUTE_UNUSED uint16_t class_def_index,
+                           ATTRIBUTE_UNUSED uint32_t method_index) override {
     return true;
   }
 
  private:
-  // Pointer to interface method changes from BCP diff
-  const InterfaceMethodChanges* interface_method_changes_;
-  const char* apk_file_path_;
-  DependencyGraph& graph_;
-  // Set of methods with compiled code: (dex_file_idx, class_def_index, method_index)
-  const CompiledMethodSet* compiled_methods_;
+  std::vector<const char*> jar_file_paths_;
+};
 
-  // Extract all classes*.dex from APK into `dex_files_`.
-  bool ExtractDexFromApk(std::string* error_msg) {
+class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
+ public:
+  using CompiledMethodSet = std::set<std::tuple<size_t, uint16_t, uint32_t>>;
+
+  DependencyGraphBuilder(const char* apk_file_path,
+                         DependencyGraph* graph,
+                         const InterfaceMethodChanges* interface_method_changes = nullptr,
+                         const CompiledMethodSet* compiled_methods = nullptr)
+      : apk_file_path_(apk_file_path),
+        compiled_methods_(compiled_methods) {
+    graph_ = graph;
+    interface_method_changes_ = interface_method_changes;
+  }
+
+  bool ExtractDex(std::string* error_msg) override {
     if (apk_file_path_ == nullptr) {
       return true;
     }
-
-    // Create DexFileLoader with APK path as location
     art::DexFileLoader loader(apk_file_path_, /*location=*/apk_file_path_);
-
-    // Open all DEX files in the container (APK is a ZIP container)
     bool success = loader.Open(
         /*verify=*/true,
         /*verify_checksum=*/true,
         /*allow_no_dex_files=*/false,
         error_msg,
         &dex_files_);
-
     if (!success || dex_files_.empty()) {
       LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
       return false;
     }
-
-    LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s):\n";
+    LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s)";
     return true;
   }
 
-  // Analyze method instructions and build method-level dependency edges.
-  bool AnalyzeDexMethods(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
-    // Get compiled methods set from OatFileAnalyzer if available
-    const auto* compiled_methods = compiled_methods_;
-
-    // Build dependency edges based on method instructions.
-    uint32_t count = 0;
-    for (art::ClassAccessor accessor : dex->GetClasses()) {
-      uint16_t class_def_index = accessor.GetClassDefIndex();
-      for (const art::ClassAccessor::Method& method : accessor.GetMethods()) {
-        // Check if method has compiled code in OAT file
-        if (compiled_methods != nullptr && !compiled_methods->empty()) {
-          auto it = compiled_methods->find({dex_file_idx, class_def_index, method.GetIndex()});
-          if (it == compiled_methods->end()) {
-            // Method not compiled, skip adding vertex
-            count++;
-            continue;
-          }
-        }
-
-        const art::CodeItemInstructionAccessor& code = method.GetInstructions();
-        std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        //std::string method_name(dex->GetMethodNameView(method.GetIndex()));
-        DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
-        graph_.AddVertexIfAbsent(method_dex_sym_id, method_name, false);
-        for (auto it = code.begin(); it != code.end(); it++) {
-          DexInstructionPcPair inst = *it;
-          if (IsInstructionInvoke(inst->Opcode())) {
-            DexInvokeType invoke_type = InvokeInstructionType(inst->Opcode());
-            switch (invoke_type) {
-              case kDexInvokeVirtual: {
-                auto method_idx = inst->VRegB();
-                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* class_descriptor = dex->GetStringData(name_id);
-                // Use descriptor mapping to get or create DexSymId
-                DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
-                graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-
-                // Edge from class to method: method depends on class (for virtual table layout)
-                graph_.UpdateEdge(
-                    class_dex_sym_id,
-                    method_dex_sym_id,
-                    std::bitset<3>(1 << static_cast<size_t>(DependencyType::kVirtualTableLayout)));
-                break;
-              }
-              case kDexInvokeSuper:
-              case kDexInvokeDirect:
-              case kDexInvokeStatic: {
-                // There is no need to handle invoke super,invoke direct and invoke static.
-                break;
-              }
-              case kDexInvokeInterface: {
-                // Get interface type and method info
-                auto method_idx = inst->VRegB();
-                const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* interface_descriptor = dex->GetStringData(name_id);
-
-                // Check if this is a boot classpath interface
-                if (!IsBootClasspathClass(interface_descriptor)) {
-                  break;
-                }
-
-                // Get method name and signature
-                const char* called_method_name = dex->GetMethodName(method_id);
-                Signature method_sig = dex->GetMethodSignature(method_id);
-                std::string method_key = std::string(called_method_name) + ":" + method_sig.ToString();
-
-                // Check if interface method has changed
-                if (interface_method_changes_ != nullptr) {
-                  auto interface_it = interface_method_changes_->find(interface_descriptor);
-                  if (interface_it != interface_method_changes_->end() &&
-                      interface_it->second.find(method_key) != interface_it->second.end()) {
-                    // Interface method changed - mark calling method as affected
-                    graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
-                    auto& vertex = graph_.graph_.get_vertex(vertex_id);
-                    if (!vertex.IsChanged()) g_interface_affected_methods++;
-                    vertex.SetChange();
-                  }
-                }
-                break;
-              }
-              default:{
-                LOG(WARNING) << "    Unknown invoke type at dex pc " << inst.DexPc()
-                             << ": opcode=" << static_cast<int>(inst->Opcode()) << "\n";
-                break;
-              }
-            }
-          } else if (IsInstructionIGetOrIPut(inst->Opcode())) {
-            auto field_idx = inst->VRegC();
-            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
-            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            // Use descriptor mapping to get or create DexSymId
-            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
-            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-
-            // Edge from class to method: method depends on class (for instance field layout)
-            graph_.UpdateEdge(
-                class_dex_sym_id,
-                method_dex_sym_id,
-                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kInstanceFieldLayout)));
-          } else if (IsInstructionSGetOrSPut(inst->Opcode())) {
-            auto field_idx = inst->VRegB();
-            const dex::FieldId& field_id = dex->GetFieldId(field_idx);
-            const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            // Use descriptor mapping to get or create DexSymId
-            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
-            graph_.AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
-
-            // Edge from class to method: method depends on class (for static field layout)
-            graph_.UpdateEdge(
-                class_dex_sym_id,
-                method_dex_sym_id,
-                std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
-          }
-        }
-      }
+  bool ShouldProcessMethod(size_t dex_file_idx,
+                           uint16_t class_def_index,
+                           uint32_t method_index) override {
+    if (compiled_methods_ == nullptr || compiled_methods_->empty()) {
+      return true;
     }
-    return true;
+    return compiled_methods_->find({dex_file_idx, class_def_index, method_index}) != compiled_methods_->end();
   }
+
+ private:
+  const char* apk_file_path_ = nullptr;
+  const CompiledMethodSet* compiled_methods_ = nullptr;
 };
 
 class DependencyGraphPropagator {
@@ -2637,7 +2520,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
         // Use heap allocation to reduce stack usage
         std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
-        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get());
+        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get(), &interface_method_changes);
         if (!bcp_method_builder.BuildGraph(&error_msg)) {
           LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
           return false;

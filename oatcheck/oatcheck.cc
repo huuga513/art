@@ -673,7 +673,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         std::string method_name(dex->PrettyMethod(method.GetIndex()));
         bool isonmeunopened=false;
-        if ((dex_file_idx == 6 && method.GetIndex() == 5469) || (dex_file_idx==5 && method.GetIndex() == 3597) || (dex_file_idx==7 && method.GetIndex() == 59095)) {
+        if ((dex_file_idx == 6 && method.GetIndex() == 5469) || (dex_file_idx==5 && method.GetIndex() == 3597) || (dex_file_idx==7 && method.GetIndex() == 59095) || (dex_file_idx==1 && method.GetIndex() == 12954)) {
           std::cout <<method_name<<"\n";
           PrintDexBytecode(dex, class_def_index, method.GetIndex());
           isonmeunopened = true;

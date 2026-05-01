@@ -200,7 +200,6 @@ struct DexSymId {
   }
   DexSymId(uint32_t dex_file_index, bool is_method, uint32_t def_id, bool is_bcp_dex = false) : id(0) {
     SetDexFileIndex(dex_file_index);
-    CHECK_EQ(dex_file_index, GetDexFileIndex());
     SetIsMethod(is_method);
     SetDefId(def_id);
     SetIsBcpDex(is_bcp_dex);
@@ -679,7 +678,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
           PrintDexBytecode(dex, class_def_index, method.GetIndex());
           isonmeunopened = true;
         }
-        DexSymId method_dex_sym_id(dex_file_idx, class_def_index, method.GetIndex());
+        DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex());
         graph_->AddVertexIfAbsent(method_dex_sym_id, method_name, false);
 
         for (auto it = code.begin(); it != code.end(); it++) {
@@ -1108,7 +1107,6 @@ class DependencyGraphPropagator {
       for (auto t:affected_bcp_methods) {
         if (t == dex_sym_id) {
           found = true;
-          initial_changed_nodes++;
           break;
         }
       }
@@ -1854,7 +1852,8 @@ class OatFileAnalyzer {
           const OatQuickMethodHeader* method_header = oat_method.GetOatQuickMethodHeader();
           if (method_header != nullptr && method_header->GetCodeSize() > 0) {
             // Method has compiled code - add to set
-            compiled_methods_.insert({i, class_def_index, method.GetIndex()});
+            DexSymId compiled_method_dex_sym_id(i, true, method.GetIndex(), false);
+            compiled_methods_.insert(compiled_method_dex_sym_id.id);
           }
         }
       }
@@ -2765,6 +2764,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         bcp_method_propagator.SetInitialChangesFromBcpClassChanges();
         bcp_method_propagator.PropagateChanges();
         auto affected_bcp_methods = bcp_method_propagator.CollectAffectedBcpMethods();
+        for (auto& affected_bcp_method: affected_bcp_methods) affected_bcp_method.SetIsBcpDex(true);
 
         // Set initial changes from BCP methods on app graph
         LOG(INFO) << "Setting initial changes from affected BCP methods...";

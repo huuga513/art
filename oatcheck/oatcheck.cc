@@ -2343,7 +2343,7 @@ class InlineCallGraphBuilder {
   const art::OatFile& oat_file_;
   const std::vector<std::unique_ptr<const art::DexFile>>& dex_files_;
 };
-// BootClassPath from lynx device, matches list_bcp_classes.py
+// use echo $BOOTCLASSPATH in target device to get boot class paths
 const std::vector<std::string> kBootClasspathJars = {
   "/apex/com.android.art/javalib/core-oj.jar",
   "/apex/com.android.art/javalib/core-libart.jar",
@@ -2356,7 +2356,6 @@ const std::vector<std::string> kBootClasspathJars = {
   "/system/framework/ext.jar",
   "/system/framework/telephony-common.jar",
   "/system/framework/voip-common.jar",
-  "/system/framework/ims-common.jar",
   "/apex/com.android.i18n/javalib/core-icu4j.jar",
   "/apex/com.android.adservices/javalib/framework-adservices.jar",
   "/apex/com.android.adservices/javalib/framework-sdksandbox.jar",
@@ -2364,7 +2363,6 @@ const std::vector<std::string> kBootClasspathJars = {
   "/apex/com.android.btservices/javalib/framework-bluetooth.jar",
   "/apex/com.android.configinfrastructure/javalib/framework-configinfrastructure.jar",
   "/apex/com.android.conscrypt/javalib/conscrypt.jar",
-  "/apex/com.android.crashrecovery/javalib/framework-crashrecovery.jar",
   "/apex/com.android.devicelock/javalib/framework-devicelock.jar",
   "/apex/com.android.healthfitness/javalib/framework-healthfitness.jar",
   "/apex/com.android.ipsec/javalib/android.net.ipsec.ike.jar",

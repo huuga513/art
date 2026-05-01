@@ -147,15 +147,15 @@ static size_t g_printed_interface_diff_count = 0;
 struct DexSymId {
   uint64_t id;
   // 64-bit layout (high to low):
-  // | 1 bit is bcp dex| 23 bits unused | 8 bits dex_file_index | 16 bits class_def_id | 16 bits method_def_id |
+  // | 1 bit is bcp dex| 1 bit is method| 22 bits unused | 8 bits dex_file_index | 32 bits def_id |
   // Bit  63: is in bcp
-  // Bits 62-40: unused (reserved)
+  // Bit  62: is method (1 = method, 0 = class)
+  // Bits 61-40: unused (reserved)
   // Bits 39-32: dex file index (0-255), 0xFF indicates external class
-  // Bits 31-16: class_def_id (0-65535), class definition index in DEX file
-  // Bits 15-0: method_def_id (0-65535), method index in DEX file, 0xFFFF indicates this is a class (not a method)
+  // Bits 31-0: def_id - class_def_id when is_method=false, method_def_id when is_method=true
   //
-  // For class: method_def_id = 0xFFFF
-  // For method: class_def_id = class_def_index of defining class, method_def_id = method index
+  // For class: is_method = 0, def_id = class_def_id
+  // For method: is_method = 1, def_id = method_def_id
   // For external class: dex_file_index = 0xFF
   void SetIsBcpDex(bool is_bcp_dex) {
     if (is_bcp_dex) {
@@ -174,37 +174,36 @@ struct DexSymId {
   uint32_t GetDexFileIndex() const {
     return (id >> 32) & 0xFF;
   }
-  void SetClassDefId(uint32_t class_def_id) {
-    id = (id & 0xFFFFFFFF0000FFFFULL) | (static_cast<uint64_t>(class_def_id & 0xFFFF) << 16);
+  void SetIsMethod(bool is_method) {
+    if (is_method) {
+        id |= (uint64_t(1) << 62);
+    } else {
+        id &= ~(uint64_t(1) << 62);
+    }
   }
-  uint32_t GetClassDefId() const {
-    return (id >> 16) & 0xFFFF;
+  bool IsMethod() const {
+    return (id >> 62) & 1;
   }
-  void SetMethodDefId(uint32_t method_def_id) {
-    id = (id & 0xFFFFFFFFFFFF0000ULL) | (method_def_id & 0xFFFF);
+  void SetDefId(uint32_t def_id) {
+    id = (id & 0xFFFFFFFF00000000ULL) | static_cast<uint64_t>(def_id);
   }
-  uint32_t GetMethodDefId() const {
-    return id & 0xFFFF;
+  uint32_t GetDefId() const {
+    return id & 0xFFFFFFFF;
   }
-  // Returns true if this is a class (method_def_id == 0xFFFF)
+  // Returns true if this is a class (is_method == false)
   bool IsClass() const {
-    return (id & 0xFFFFULL) == 0xFFFF;
+    return !IsMethod();
   }
   // Returns true if this represents an external class (dex_file_index == 0xFF)
   bool IsExternalClass() const {
     return GetDexFileIndex() == 0xFF;
   }
-  // Constructor for class: method_def_id defaults to 0xFFFF
-  DexSymId(uint32_t dex_file_index, uint32_t class_def_id) : id(0) {
+  DexSymId(uint32_t dex_file_index, bool is_method, uint32_t def_id, bool is_bcp_dex = false) : id(0) {
     SetDexFileIndex(dex_file_index);
-    SetClassDefId(class_def_id);
-    SetMethodDefId(0xFFFF);
-  }
-  // Constructor for method: takes dex_file_index, class_def_id, and method_def_id
-  DexSymId(uint32_t dex_file_index, uint32_t class_def_id, uint32_t method_def_id) : id(0) {
-    SetDexFileIndex(dex_file_index);
-    SetClassDefId(class_def_id);
-    SetMethodDefId(method_def_id);
+    CHECK_EQ(dex_file_index, GetDexFileIndex());
+    SetIsMethod(is_method);
+    SetDefId(def_id);
+    SetIsBcpDex(is_bcp_dex);
   }
   // Construct DexSymId from graaf vertex_id_t. Since vertex_id_t is directly
   // mapped to DexSymId.id, we can directly assign it.
@@ -472,8 +471,9 @@ class BcpDependencyGraph : public DependencyGraph {
   // Construct ClassAccessor from DexSymId
   // DexSymId encodes: dex_file_index in high bits, class_def_index in low bits
   art::ClassAccessor GetClassAccessor(const DexSymId& dex_sym_id) const {
+    CHECK(HasClassAccessor(dex_sym_id));
     uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
-    uint32_t class_def_index = dex_sym_id.GetClassDefId();
+    uint32_t class_def_index = dex_sym_id.GetDefId();
 
     const art::DexFile* dex = dex_files_->at(dex_file_index).get();
     return art::ClassAccessor(*dex, class_def_index);
@@ -483,10 +483,13 @@ class BcpDependencyGraph : public DependencyGraph {
   // Returns false for external classes (dex_file_index = 0xFF)
   bool HasClassAccessor(const DexSymId& dex_sym_id) const {
     uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
-    uint32_t class_def_index = dex_sym_id.GetClassDefId();
+    uint32_t class_def_index = dex_sym_id.GetDefId();
 
     // External class marker (0xFF) is not valid for ClassAccessor
-    if (dex_file_index == 0xFF) {
+    if (dex_sym_id.IsBcpDex()) {
+      return false;
+    }
+    if (dex_sym_id.IsMethod()) {
       return false;
     }
     if (dex_file_index >= dex_files_->size()) {
@@ -498,7 +501,7 @@ class BcpDependencyGraph : public DependencyGraph {
 
   // Check if DexSymId represents an external class (not in app dex files)
   bool IsExternalClass(const DexSymId& dex_sym_id) const {
-    return dex_sym_id.GetDexFileIndex() == 0xFF;
+    return dex_sym_id.IsBcpDex();
   }
 
  private:
@@ -533,12 +536,22 @@ class DependencyGraphBuilderBase {
   // Step 1: Build descriptor -> DexSymId mapping for all classes in the dex file.
   // Uses class_def_index (not type_idx) to correctly construct ClassAccessor/DexSymId.
   bool BuildDescriptorMapping(const art::DexFile* dex, size_t dex_file_idx, DependencyGraph* graph) {
+    LOG(INFO) << "dex:"<<dex_file_idx <<dex->GetLocation();
     for (art::ClassAccessor accessor : dex->GetClasses()) {
       uint32_t class_def_index = accessor.GetClassDefIndex();
       const char* class_descriptor = accessor.GetDescriptor();
-      DexSymId class_dex_sym_id(dex_file_idx, class_def_index);
+      CHECK_LT(dex_file_idx, 256u) << "dex_file_index only supports 8 bits (0-255)";
+      DexSymId class_dex_sym_id(dex_file_idx, false, class_def_index);
+      CHECK_EQ(class_dex_sym_id.GetDexFileIndex(), dex_file_idx);
       descriptor_to_symid_.emplace(class_descriptor, class_dex_sym_id);
       // Also add vertex for the class itself
+      if (graph->graph_.has_vertex(class_dex_sym_id.id)) {
+        if (graph->graph_.get_vertex(class_dex_sym_id.id).GetDescriptor() != class_descriptor) {
+          LOG(ERROR) << "Wrong descriptor mapping" << graph->graph_.get_vertex(class_dex_sym_id.id).GetDescriptor() << " vs " << class_descriptor;
+          LOG(ERROR) << class_dex_sym_id.GetDexFileIndex() << ":" <<class_dex_sym_id.GetDefId();
+          CHECK(false);
+        }
+      }
       graph->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
     }
     return true;
@@ -553,7 +566,11 @@ class DependencyGraphBuilderBase {
       return it->second;
     }
     // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
-    DexSymId external_symid(0xFF, external_class_counter_);
+    DexSymId external_symid(0xFF, false, external_class_counter_); // TODO: fix me
+    // Check if this external class is actually in the boot classpath
+    if (IsBootClasspathClass(descriptor)) {
+      external_symid.SetIsBcpDex(true);
+    }
     descriptor_to_symid_.emplace(descriptor, external_symid);
     external_class_counter_++;
     return external_symid;
@@ -822,6 +839,7 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
     // Set the dex files reference on BcpDependencyGraph
     bcp_graph_.SetDexFiles(&dex_files_);
+    LOG(INFO) << "Bcp totoal dex files count:" << dex_files_.size();
 
     size_t i = 0;
     for (const auto& dex : dex_files_) {
@@ -862,6 +880,7 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
       // Move loaded dex files to the global list
       for (auto& dex : jar_dex_files) {
+        class_def_count += dex->NumClassDefs();
         dex_files_.push_back(std::move(dex));
       }
     }
@@ -870,6 +889,7 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
       *error_msg = "No DEX files loaded from any JAR files";
       return false;
     }
+    LOG(INFO) << "Bcp class def count total:" << class_def_count;
 
     return true;
   }
@@ -889,6 +909,7 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
   std::vector<const char*> jar_file_paths_;
   BcpDependencyGraph& bcp_graph_;
+  size_t class_def_count = 0;
 };
 
 // BCP method dependency graph builder - reuses DependencyGraphBuilder logic
@@ -948,7 +969,7 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods
 
 class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
  public:
-  using CompiledMethodSet = std::set<std::tuple<size_t, uint16_t, uint32_t>>;
+  using CompiledMethodSet = std::set<uint64_t>;
 
   DependencyGraphBuilder(const char* apk_file_path,
                          DependencyGraph* graph,
@@ -1085,9 +1106,7 @@ class DependencyGraphPropagator {
       }
       bool found = false;
       for (auto t:affected_bcp_methods) {
-        DexSymId k = t;
-        k.SetIsBcpDex(true);
-        if (k.GetDexFileIndex()==dex_sym_id.GetDexFileIndex() && k.GetMethodDefId() == dex_sym_id.GetMethodDefId()) {
+        if (t == dex_sym_id) {
           found = true;
           initial_changed_nodes++;
           break;
@@ -1739,7 +1758,7 @@ class BcpMethodDependencyGraphPropagator {
 
       if (vertex.IsChanged()) {
         affected_methods.push_back(dex_sym_id);
-        if (vertex.GetDescriptor().starts_with("boolean android.app.Activity.onMenuOpened")) LOG(INFO)<<"Beeeeee" << dex_sym_id.GetDexFileIndex() << ":" << dex_sym_id.GetMethodDefId();
+        if (vertex.GetDescriptor().starts_with("boolean android.app.Activity.onMenuOpened")) LOG(INFO)<<"Beeeeee" << dex_sym_id.GetDexFileIndex() << ":" << dex_sym_id.GetDefId();
         collected++;
       }
     }
@@ -1776,7 +1795,7 @@ class OatFileAnalyzer {
 
   // Returns the set of methods that have compiled code in the OAT file.
   // Key: (dex_file_idx, class_def_index, method_index)
-  const std::set<std::tuple<size_t, uint16_t, uint32_t>>& GetCompiledMethods() const {
+  const DependencyGraphBuilder::CompiledMethodSet& GetCompiledMethods() const {
     return compiled_methods_;
   }
 
@@ -1894,7 +1913,7 @@ class OatFileAnalyzer {
   std::unique_ptr<art::OatFile> oat_file_;
   std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
   // Precomputed set of methods with compiled code: (dex_file_idx, class_def_index, method_index)
-  std::set<std::tuple<size_t, uint16_t, uint32_t>> compiled_methods_;
+  DependencyGraphBuilder::CompiledMethodSet compiled_methods_;
 };
 
 // OatFilePatcher modifies OAT files to disable compiled methods by setting their code_offset to 0.
@@ -2211,7 +2230,7 @@ class InlineCallGraphBuilder {
       const art::DexFile* dex_file = dex_files_[i].get();
       // Skip DEX location check because DEX files extracted from APK may not match OAT file's recorded location
       for (ClassAccessor accessor : dex_file->GetClasses()) {
-        const uint16_t class_def_index = accessor.GetClassDefIndex();
+        const uint32_t class_def_index = accessor.GetClassDefIndex();
         const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
         uint32_t class_method_index = 0;
 
@@ -2227,7 +2246,7 @@ class InlineCallGraphBuilder {
           uint32_t dex_method_idx = method.GetIndex();
           std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
           std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
-          DexSymId dex_sym_id(i, class_def_index, dex_method_idx);
+          DexSymId dex_sym_id(i, true, dex_method_idx);
           graph_.AddVertexIfAbsent(dex_sym_id, pretty_method, false);
         }
       }
@@ -2254,16 +2273,14 @@ class InlineCallGraphBuilder {
             continue;
           }
           uint32_t dex_method_idx = method.GetIndex();
-          std::string method_name = dex_file->GetMethodName(dex_file->GetMethodId(dex_method_idx));
-          std::string pretty_method = dex_file->PrettyMethod(dex_method_idx, true);
-          DexSymId caller_dex_sym_id(i, class_def_index, dex_method_idx);
-          AnalyzeOatMethod(method_header, class_def_index, caller_dex_sym_id);
+          DexSymId caller_dex_sym_id(i, true, dex_method_idx);
+          AnalyzeOatMethod(method_header, caller_dex_sym_id);
         }
       }
     }
     return true;
   }
-  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, uint16_t caller_class_def_idx, const DexSymId caller_dex_sym_id) {
+  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id) {
     CodeInfo code_info(caller_header);
     std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
     bool isonme = false;
@@ -2273,30 +2290,49 @@ class InlineCallGraphBuilder {
         MethodInfo method_info = code_info.GetMethodInfoOf(inline_info);
 
         // Prefer MethodInfo regardless of whether ArtMethod* is available or not
-        if (method_info.HasDexFileIndex()) {
-          graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
-          DexSymId callee_dex_sym_id(method_info.GetDexFileIndex(), caller_class_def_idx, method_info.GetMethodIndex());
-          if (isonme) LOG(INFO) << "Deee"<<callee_dex_sym_id.GetDexFileIndex() << ":" <<callee_dex_sym_id.GetMethodDefId();
-          // Try to get method name
-          std::string method_name;
-          if (inline_info.EncodesArtMethod()) {
-            ArtMethod* callee = inline_info.GetArtMethod();
-            ScopedObjectAccess soa(Thread::Current());
-            method_name = callee->PrettyMethod();
-          } else {
-            // No ArtMethod*, use index as method name
-            method_name = android::base::StringPrintf("d%uu%u", method_info.GetDexFileIndex(), method_info.GetMethodIndex());
-            if (method_info.GetDexFileIndexKind() == MethodInfo::kKindBCP) {
-              callee_dex_sym_id.SetIsBcpDex(true);
-            }
-          }
-          graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
+        // Note: HasDexFileIndex() returns false for kSameDexFile (when GetDexFileIndexKind() == -1)
+        uint32_t dex_kind = method_info.GetDexFileIndexKind();
+        uint32_t dex_file_index;
+        bool is_bcp_dex = false;
 
-          graph_.AddVertexIfAbsent(callee_dex_sym_id, method_name, false);
-          // If method A inlines method B, create edge A → B to indicate that A inlines B
-          if (!graph_.graph_.has_edge(vertex_id_caller, vertex_id_callee)) {
-            graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
+        if (dex_kind == MethodInfo::kKindBCP) {
+          // BCP method: use method_info's dex file index, is_bcp_dex = true
+          dex_file_index = method_info.GetDexFileIndex();
+          is_bcp_dex = true;
+        } else if (dex_kind == MethodInfo::kKindNonBCP) {
+          // kKindNonBCP: use method_info's dex file index if HasDexFileIndex, else use caller's dex file index, is_bcp_dex = false
+          if (!method_info.HasDexFileIndex()) {
+            dex_file_index = caller_dex_sym_id.GetDexFileIndex();
+          } else {
+            dex_file_index = method_info.GetDexFileIndex();
           }
+          is_bcp_dex = false;
+        } else {
+          dex_file_index = method_info.GetDexFileIndex();
+          is_bcp_dex = false;
+        }
+
+        graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
+        // Create callee DexSymId: is_method = true, def_id = GetMethodIndex()
+        DexSymId callee_dex_sym_id(dex_file_index, true, method_info.GetMethodIndex(), is_bcp_dex);
+
+        if (isonme) LOG(INFO) << "Deee" << "is bcp" << callee_dex_sym_id.IsBcpDex() << ";" <<callee_dex_sym_id.GetDexFileIndex() << ":" << callee_dex_sym_id.GetDefId();
+        // Try to get method name
+        std::string method_name;
+        if (inline_info.EncodesArtMethod()) {
+          ArtMethod* callee = inline_info.GetArtMethod();
+          ScopedObjectAccess soa(Thread::Current());
+          method_name = callee->PrettyMethod();
+        } else {
+          // No ArtMethod*, use index as method name
+          method_name = android::base::StringPrintf("d%uu%u", dex_file_index, method_info.GetMethodIndex());
+        }
+        graaf::vertex_id_t vertex_id_callee = static_cast<graaf::vertex_id_t>(callee_dex_sym_id.id);
+
+        graph_.AddVertexIfAbsent(callee_dex_sym_id, method_name, false);
+        // If method A inlines method B, create edge A → B to indicate that A inlines B
+        if (!graph_.graph_.has_edge(vertex_id_caller, vertex_id_callee)) {
+          graph_.graph_.add_edge(vertex_id_caller, vertex_id_callee, InlineCallGraphEdge());
         }
       }
     }
@@ -2750,7 +2786,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
             DexSymId sym_id(vertex_id);
             if (!sym_id.IsClass()) {
               const std::string& method_name = vertex.GetDescriptor();
-              if (compiled_methods->find({sym_id.GetDexFileIndex(), sym_id.GetClassDefId(), sym_id.GetMethodDefId()}) == compiled_methods->end()) continue;
+              if (compiled_methods->find(vertex_id) == compiled_methods->end()) continue;
               aot_invalidated_methods++;
               aot_invalidated_method_names.push_back(vertex.GetDescriptor());
             } else {

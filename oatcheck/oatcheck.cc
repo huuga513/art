@@ -97,7 +97,7 @@ static bool LoadDexFilesFromJars(const std::vector<std::string>& jar_paths,
   return !out_dex_files->empty();
 }
 
-static void PrintDexBytecode(const DexFile* dex_file,
+static void ATTRIBUTE_UNUSED PrintDexBytecode(const DexFile* dex_file,
                               uint16_t class_def_idx,
                               uint32_t method_idx) {
   if (dex_file == nullptr) {
@@ -706,12 +706,6 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
 
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        bool isonmeunopened=false;
-        if ((dex_file_idx == 6 && method.GetIndex() == 5469) || (dex_file_idx==5 && method.GetIndex() == 3597) || (dex_file_idx==7 && method.GetIndex() == 59095) || (dex_file_idx==1 && method.GetIndex() == 12954)) {
-          std::cout <<method_name<<"\n";
-          PrintDexBytecode(dex, class_def_index, method.GetIndex());
-          isonmeunopened = true;
-        }
         DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex());
         graph_->AddVertexIfAbsent(method_dex_sym_id, method_name, false);
 
@@ -830,7 +824,6 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
-              if (isonmeunopened) LOG(INFO)<<"Aeeeee";
             }
           } else if (inst->Opcode() == Instruction::CONST_CLASS) {
             auto type_idx = inst->VRegB();
@@ -1692,7 +1685,6 @@ class BcpMethodDependencyGraphPropagator {
 
       if (vertex.IsChanged()) {
         affected_methods.push_back(dex_sym_id);
-        if (vertex.GetDescriptor().starts_with("boolean android.app.Activity.onMenuOpened")) LOG(INFO)<<"Beeeeee" << dex_sym_id.GetDexFileIndex() << ":" << dex_sym_id.GetDefId();
         collected++;
       }
     }
@@ -2048,8 +2040,6 @@ class InlineCallGraphBuilder {
   bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id) {
     CodeInfo code_info(caller_header);
     std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
-    bool isonme = false;
-    if (caller_method_name.starts_with("boolean com.tencent.shadow.core.runtime.container.PluginContainerAppCompatActivity.onMenuOpened")) isonme = true;
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
         MethodInfo method_info = code_info.GetMethodInfoOf(inline_info);
@@ -2081,7 +2071,6 @@ class InlineCallGraphBuilder {
         // Create callee DexSymId: is_method = true, def_id = GetMethodIndex()
         DexSymId callee_dex_sym_id(dex_file_index, true, method_info.GetMethodIndex(), is_bcp_dex);
 
-        if (isonme) LOG(INFO) << "Deee" << "is bcp" << callee_dex_sym_id.IsBcpDex() << ";" <<callee_dex_sym_id.GetDexFileIndex() << ":" << callee_dex_sym_id.GetDefId();
         // Try to get method name
         std::string method_name;
         if (inline_info.EncodesArtMethod()) {

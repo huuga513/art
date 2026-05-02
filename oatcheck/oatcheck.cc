@@ -61,6 +61,42 @@
 #include "scoped_thread_state_change-inl.h"
 using namespace art;
 
+// Builds full JAR paths from a directory prefix and a vector of relative jar paths.
+// Ensure prefix ends with '/' before joining.
+static std::vector<std::string> BuildJarPaths(const std::string& prefix,
+                                               const std::vector<std::string>& jar_relative_paths) {
+  std::string normalized_prefix = prefix;
+  if (!normalized_prefix.empty() && normalized_prefix.back() != '/') {
+    normalized_prefix += '/';
+  }
+  std::vector<std::string> full_paths;
+  full_paths.reserve(jar_relative_paths.size());
+  for (const auto& jar_relative_path : jar_relative_paths) {
+    // jar_relative_path starts with /, so skip it when joining
+    full_paths.push_back(normalized_prefix + jar_relative_path.substr(1));
+  }
+  return full_paths;
+}
+
+// Loads all DEX files from a vector of JAR paths.
+// Returns the loaded dex files in `out_dex_files` and true on success, or false on error.
+static bool LoadDexFilesFromJars(const std::vector<std::string>& jar_paths,
+                                  std::string* error_msg,
+                                  std::vector<std::unique_ptr<const art::DexFile>>* out_dex_files) {
+  for (const auto& jar_path : jar_paths) {
+    art::DexFileLoader loader(jar_path.c_str(), jar_path.c_str());
+    std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
+    if (!loader.Open(/*verify=*/true, /*verify_checksum=*/true, /*allow_no_dex_files=*/true, error_msg, &jar_dex_files)) {
+      LOG(WARNING) << "Failed to load JAR " << jar_path << ": " << *error_msg << ", skipping";
+      continue;
+    }
+    for (auto& dex : jar_dex_files) {
+      out_dex_files->push_back(std::move(dex));
+    }
+  }
+  return !out_dex_files->empty();
+}
+
 static void PrintDexBytecode(const DexFile* dex_file,
                               uint16_t class_def_idx,
                               uint32_t method_idx) {
@@ -2359,10 +2395,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     std::string error_msg;
     std::ostream* os = &std::cout;
-    if (args_->output_file_ != nullptr) {
-      LOG(WARNING) << "--output not implemented yet; using stdout";
-    }
-
     // BCP change detection flow - run first to get interface method changes
     // Use a local variable instead of pointer to avoid dangling reference
     InterfaceMethodChanges interface_method_changes;
@@ -2375,24 +2407,16 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
       LOG(INFO) << "Starting BCP change detection...";
 
-      // Collect original BCP JAR paths
-      std::vector<const char*> original_bcp_jars;
-      std::vector<std::string> original_paths_storage; // To keep strings alive
-
-      std::string origin_prefix = args_->origin_bcp_prefix_;
-      // Ensure prefix ends with /
-      if (!origin_prefix.empty() && origin_prefix.back() != '/') {
-        origin_prefix += '/';
-      }
-      for (const auto& jar_relative_path : kBootClasspathJars) {
-        // jar_relative_path starts with /, so we need to skip it when joining
-        std::string full_path = origin_prefix + jar_relative_path.substr(1);
-        original_paths_storage.push_back(full_path);
-        original_bcp_jars.push_back(original_paths_storage.back().c_str());
-      }
+      // Build original BCP JAR paths
+      std::vector<std::string> original_paths_storage = BuildJarPaths(
+          args_->origin_bcp_prefix_, kBootClasspathJars);
 
       // Build original BCP dependency graph
       std::unique_ptr<BcpDependencyGraph> original_bcp_graph = std::make_unique<BcpDependencyGraph>();
+      std::vector<const char*> original_bcp_jars;
+      for (const auto& path : original_paths_storage) {
+        original_bcp_jars.push_back(path.c_str());
+      }
       BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, original_bcp_graph.get());
       if (!bcp_builder.BuildGraph(&error_msg)) {
         LOG(ERROR) << "Failed to build original BCP dependency graph: " << error_msg;
@@ -2402,26 +2426,9 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
       // Load updated BCP DEX files
       std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
-      std::string updated_prefix = args_->updated_bcp_prefix_;
-      // Ensure prefix ends with /
-      if (!updated_prefix.empty() && updated_prefix.back() != '/') {
-        updated_prefix += '/';
-      }
-      for (const auto& jar_relative_path : kBootClasspathJars) {
-        // jar_relative_path starts with /, so we need to skip it when joining
-        std::string jar_path = updated_prefix + jar_relative_path.substr(1);
-        art::DexFileLoader loader(jar_path.c_str(), jar_path.c_str());
-        std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
-        if (!loader.Open(/*verify=*/true, /*verify_checksum=*/true, /*allow_no_dex_files=*/true, &error_msg, &jar_dex_files)) {
-          LOG(WARNING) << "Failed to load updated JAR " << jar_path << ": " << error_msg << ", skipping";
-          continue;
-        }
-        for (auto& dex : jar_dex_files) {
-          updated_boot_dex_files.push_back(std::move(dex));
-        }
-      }
-
-      if (updated_boot_dex_files.empty()) {
+      std::vector<std::string> updated_paths = BuildJarPaths(
+          args_->updated_bcp_prefix_, kBootClasspathJars);
+      if (!LoadDexFilesFromJars(updated_paths, &error_msg, &updated_boot_dex_files)) {
         LOG(ERROR) << "No DEX files loaded from updated boot classes directory";
         return false;
       }
@@ -2449,10 +2456,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
       // Get string ID changes for app dependency graph
       string_id_changes = bcp_propagator.GetStringIdChanges();
-
-      if (string_id_changes.find("Tried to open action bar menu with no action bar") != string_id_changes.end()) {
-        LOG(INFO) << "Ceeeeee";
-      }
 
       // Get type ID changes for app dependency graph
       type_id_changes = bcp_propagator.GetTypeIdChanges();
@@ -2569,15 +2572,10 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         // Build BCP method dependency graph and propagate to get affected BCP methods
         LOG(INFO) << "Building BCP method dependency graph for method change analysis...";
         std::vector<const char*> original_bcp_jars;
-        std::vector<std::string> original_paths_storage;
-        std::string origin_prefix = args_->origin_bcp_prefix_;
-        if (!origin_prefix.empty() && origin_prefix.back() != '/') {
-          origin_prefix += '/';
-        }
-        for (const auto& jar_relative_path : kBootClasspathJars) {
-          std::string full_path = origin_prefix + jar_relative_path.substr(1);
-          original_paths_storage.push_back(full_path);
-          original_bcp_jars.push_back(original_paths_storage.back().c_str());
+        std::vector<std::string> original_paths = BuildJarPaths(
+            args_->origin_bcp_prefix_, kBootClasspathJars);
+        for (const auto& path : original_paths) {
+          original_bcp_jars.push_back(path.c_str());
         }
 
         // Use heap allocation to reduce stack usage

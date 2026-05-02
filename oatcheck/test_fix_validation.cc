@@ -390,8 +390,8 @@ static std::optional<CodeDifference> CompareMethodCode(
       // TODO: find out what makes adrp different
       if (IsAdrpInsn(fixed_method.code_ptr, fixed_idx) &&
           IsAdrpInsn(orig_method.code_ptr, orig_idx)) {
-        fixed_idx += 8;
-        orig_idx += 8;
+        fixed_idx += 4;
+        orig_idx += 4;
         continue;
       }
       // Real difference found.

@@ -20,7 +20,7 @@ for app in "$BASE_DIR/$NEW_VER"/*/; do
     python3 "$OATCHECK_DIR/test_fix_validation_host.py" \
         --fixed-oat="$fixed_oat" \
         --original-oat="$original_oat" \
-        --compare-code > "$diff_log" 2>&1
+        --compare-code --max-diffs=1000 > "$diff_log" 2>&1
 
     echo "Step 2: Run oatcheck..."
     python3 "$OATCHECK_DIR/oatcheck_host.py" \

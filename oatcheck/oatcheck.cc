@@ -559,7 +559,7 @@ class DependencyGraphBuilderBase {
 
  protected:
   // Common member variables
-  std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
+  const std::vector<std::unique_ptr<const art::DexFile>>& dex_files_;
 
   // Descriptor -> DexSymId mapping for O(1) lookup
   // This maps class descriptors to their DexSymId (using class_def_index)
@@ -567,6 +567,9 @@ class DependencyGraphBuilderBase {
 
   // Counter for assigning unique sym_ids to external classes
   uint32_t external_class_counter_ = 0;
+
+  DependencyGraphBuilderBase(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files)
+      : dex_files_(dex_files) {}
 
   // Step 1: Build descriptor -> DexSymId mapping for all classes in the dex file.
   // Uses class_def_index (not type_idx) to correctly construct ClassAccessor/DexSymId.
@@ -646,9 +649,6 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
  public:
   virtual ~DependencyGraphBuilderWithMethods() = default;
 
-  // Override point 1: Extract DEX files (JAR vs APK)
-  virtual bool ExtractDex(std::string* error_msg) = 0;
-
   // Override point 2: Whether to process a given method (for compiled method filtering)
   virtual bool ShouldProcessMethod(size_t dex_file_idx,
                                    uint16_t class_def_index,
@@ -656,10 +656,6 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
 
   // Common BuildGraph implementation
   bool BuildGraph(std::string* error_msg) override {
-    if (!ExtractDex(error_msg)) {
-      return false;
-    }
-
     size_t i = 0;
     // Step 1: Build descriptor -> DexSymId mapping for all dex files
     for (const auto& dex : dex_files_) {
@@ -687,6 +683,8 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
   }
 
  protected:
+  DependencyGraphBuilderWithMethods(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files)
+      : DependencyGraphBuilderBase(dex_files) {}
   DependencyGraph* graph_ = nullptr;
   // Interface method changes from BCP diff: interface_descriptor -> set of changed method keys
   const InterfaceMethodChanges* interface_method_changes_ = nullptr;
@@ -864,17 +862,15 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
 
 class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
  public:
-  BcpDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths, BcpDependencyGraph* bcp_graph)
-      : jar_file_paths_(jar_file_paths), bcp_graph_(*bcp_graph) {}
+  BcpDependencyGraphBuilder(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files,
+                             BcpDependencyGraph* bcp_graph)
+      : DependencyGraphBuilderBase(dex_files),
+        bcp_graph_(*bcp_graph) {}
 
   bool BuildGraph(std::string* error_msg) override {
-    if (!ExtractDexFromJars(error_msg)) {
-      return false;
-    }
-
     // Set the dex files reference on BcpDependencyGraph
     bcp_graph_.SetDexFiles(&dex_files_);
-    LOG(INFO) << "Bcp totoal dex files count:" << dex_files_.size();
+    LOG(INFO) << "Bcp total dex files count:" << dex_files_.size();
 
     size_t i = 0;
     for (const auto& dex : dex_files_) {
@@ -889,106 +885,36 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
   }
 
  private:
-  // Extract all classes*.dex from all JAR files into `dex_files_`.
-  bool ExtractDexFromJars(std::string* error_msg) {
-    for (const char* jar_file_path : jar_file_paths_) {
-      if (jar_file_path == nullptr) {
-        continue;
-      }
-
-      // Create DexFileLoader with JAR path as location
-      art::DexFileLoader loader(jar_file_path, /*location=*/jar_file_path);
-
-      // Open all DEX files in the JAR container
-      std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
-      bool success = loader.Open(
-          /*verify=*/true,
-          /*verify_checksum=*/true,
-          /*allow_no_dex_files=*/false,
-          error_msg,
-          &jar_dex_files);
-
-      if (!success || jar_dex_files.empty()) {
-        LOG(ERROR) << "Failed to load DEX from JAR " << jar_file_path << ": " << *error_msg;
-        return false;
-      }
-
-      // Move loaded dex files to the global list
-      for (auto& dex : jar_dex_files) {
-        class_def_count += dex->NumClassDefs();
-        dex_files_.push_back(std::move(dex));
-      }
-    }
-
-    if (dex_files_.empty()) {
-      *error_msg = "No DEX files loaded from any JAR files";
-      return false;
-    }
-    LOG(INFO) << "Bcp class def count total:" << class_def_count;
-
-    return true;
-  }
-
-  // Combined method that calls base class methods for mapping and edges
-  bool AnalyzeDexClasses(const art::DexFile* dex, size_t dex_file_idx, ATTRIBUTE_UNUSED std::string* error_msg) {
+  bool AnalyzeDexClasses(const art::DexFile* dex, size_t dex_file_idx, std::string* error_msg) {
     // Step 1: Build descriptor -> DexSymId mapping
     if (!BuildDescriptorMapping(dex, dex_file_idx, &bcp_graph_)) {
+      *error_msg = "Failed to build descritpor mapping";
       return false;
     }
     // Step 2: Build dependency edges
     if (!BuildDependencyEdges(dex, dex_file_idx, &bcp_graph_)) {
+      *error_msg = "Failed to build dependency edges";
       return false;
     }
     return true;
   }
-
-  std::vector<const char*> jar_file_paths_;
   BcpDependencyGraph& bcp_graph_;
-  size_t class_def_count = 0;
 };
 
 // BCP method dependency graph builder - reuses DependencyGraphBuilder logic
 // but processes ALL BCP methods (not filtered by compiled methods)
 class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
  public:
-  BcpMethodDependencyGraphBuilder(const std::vector<const char*>& jar_file_paths,
+  BcpMethodDependencyGraphBuilder(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files,
                                  DependencyGraph* graph,
                                  const InterfaceMethodChanges* interface_method_changes = nullptr,
                                  StringIdChanges* string_id_changes = nullptr,
                                  const TypeIdChanges* type_id_changes = nullptr)
-      : jar_file_paths_(jar_file_paths) {
+      : DependencyGraphBuilderWithMethods(dex_files) {
     graph_ = graph;
     interface_method_changes_ = interface_method_changes;
     string_id_changes_ = string_id_changes;
     type_id_changes_ = type_id_changes;
-  }
-
-  bool ExtractDex(std::string* error_msg) override {
-    for (const char* jar_file_path : jar_file_paths_) {
-      if (jar_file_path == nullptr) {
-        continue;
-      }
-      art::DexFileLoader loader(jar_file_path, /*location=*/jar_file_path);
-      std::vector<std::unique_ptr<const art::DexFile>> jar_dex_files;
-      bool success = loader.Open(
-          /*verify=*/true,
-          /*verify_checksum=*/true,
-          /*allow_no_dex_files=*/false,
-          error_msg,
-          &jar_dex_files);
-      if (!success || jar_dex_files.empty()) {
-        LOG(ERROR) << "Failed to load DEX from JAR " << jar_file_path << ": " << *error_msg;
-        return false;
-      }
-      for (auto& dex : jar_dex_files) {
-        dex_files_.push_back(std::move(dex));
-      }
-    }
-    if (dex_files_.empty()) {
-      *error_msg = "No DEX files loaded from any JAR files";
-      return false;
-    }
-    return true;
   }
 
   // Process ALL methods (no filtering)
@@ -998,45 +924,22 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods
     return true;
   }
 
- private:
-  std::vector<const char*> jar_file_paths_;
 };
 
 class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
  public:
   using CompiledMethodSet = std::set<uint64_t>;
 
-  DependencyGraphBuilder(const char* apk_file_path,
-                         DependencyGraph* graph,
+  DependencyGraphBuilder(DependencyGraph* graph,
+                         const std::vector<std::unique_ptr<const art::DexFile>>& app_dex_files,
                          const InterfaceMethodChanges* interface_method_changes = nullptr,
                          const StringIdChanges* string_id_changes = nullptr,
-                         const TypeIdChanges* type_id_changes = nullptr,
-                         const CompiledMethodSet* compiled_methods = nullptr)
-      : apk_file_path_(apk_file_path),
-        compiled_methods_(compiled_methods) {
+                         const TypeIdChanges* type_id_changes = nullptr)
+      : DependencyGraphBuilderWithMethods(app_dex_files) {
     graph_ = graph;
     interface_method_changes_ = interface_method_changes;
     string_id_changes_ = string_id_changes;
     type_id_changes_ = type_id_changes;
-  }
-
-  bool ExtractDex(std::string* error_msg) override {
-    if (apk_file_path_ == nullptr) {
-      return true;
-    }
-    art::DexFileLoader loader(apk_file_path_, /*location=*/apk_file_path_);
-    bool success = loader.Open(
-        /*verify=*/true,
-        /*verify_checksum=*/true,
-        /*allow_no_dex_files=*/false,
-        error_msg,
-        &dex_files_);
-    if (!success || dex_files_.empty()) {
-      LOG(ERROR) << "Failed to load DEX from APK: " << *error_msg;
-      return false;
-    }
-    LOG(INFO) << "Loaded " << dex_files_.size() << " DEX file(s)";
-    return true;
   }
 
   bool ShouldProcessMethod(ATTRIBUTE_UNUSED size_t dex_file_idx,
@@ -1049,9 +952,6 @@ class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
     //return compiled_methods_->find({dex_file_idx, class_def_index, method_index}) != compiled_methods_->end();
   }
 
- private:
-  const char* apk_file_path_ = nullptr;
-  ATTRIBUTE_UNUSED const CompiledMethodSet* compiled_methods_ = nullptr;
 };
 
 class DependencyGraphPropagator {
@@ -1809,7 +1709,9 @@ class BcpMethodDependencyGraphPropagator {
 
 class OatFileAnalyzer {
  public:
-  OatFileAnalyzer(const char* oat_file_path) : oat_file_path_(oat_file_path) {}
+  OatFileAnalyzer(const char* oat_file_path,
+                  const std::vector<std::unique_ptr<const art::DexFile>>& app_dex_files)
+      : oat_file_path_(oat_file_path), app_dex_files_(app_dex_files) {}
   bool LoadOatFile(std::string* error_msg) {
     oat_file_.reset(OatFile::Open(/* zip_fd */ -1,
                                   oat_file_path_,
@@ -1915,7 +1817,7 @@ class OatFileAnalyzer {
         continue;
       }
 
-      const art::DexFile* dex_file = dex_files_[i].get();
+      const art::DexFile* dex_file = app_dex_files_[i].get();
       // Skip DEX location check because DEX files extracted from APK may not match OAT file's recorded location
       for (ClassAccessor accessor : dex_file->GetClasses()) {
         const uint16_t class_def_index = accessor.GetClassDefIndex();
@@ -1946,7 +1848,7 @@ class OatFileAnalyzer {
  private:
   const char* oat_file_path_;
   std::unique_ptr<art::OatFile> oat_file_;
-  std::vector<std::unique_ptr<const art::DexFile>> dex_files_;
+  const std::vector<std::unique_ptr<const art::DexFile>>& app_dex_files_;
   // Precomputed set of methods with compiled code: (dex_file_idx, class_def_index, method_index)
   DependencyGraphBuilder::CompiledMethodSet compiled_methods_;
 };
@@ -2403,6 +2305,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Changed class info for app dependency graph - populated when BCP diff is enabled
     std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info;
+    std::vector<std::unique_ptr<const art::DexFile>> original_bcp_dex_files;
 
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
       LOG(INFO) << "Starting BCP change detection...";
@@ -2411,13 +2314,15 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       std::vector<std::string> original_paths_storage = BuildJarPaths(
           args_->origin_bcp_prefix_, kBootClasspathJars);
 
+      // Load original BCP DEX files
+      if (!LoadDexFilesFromJars(original_paths_storage, &error_msg, &original_bcp_dex_files)) {
+        LOG(ERROR) << "No DEX files loaded from original boot classes directory";
+        return false;
+      }
+
       // Build original BCP dependency graph
       std::unique_ptr<BcpDependencyGraph> original_bcp_graph = std::make_unique<BcpDependencyGraph>();
-      std::vector<const char*> original_bcp_jars;
-      for (const auto& path : original_paths_storage) {
-        original_bcp_jars.push_back(path.c_str());
-      }
-      BcpDependencyGraphBuilder bcp_builder(original_bcp_jars, original_bcp_graph.get());
+      BcpDependencyGraphBuilder bcp_builder(original_bcp_dex_files, original_bcp_graph.get());
       if (!bcp_builder.BuildGraph(&error_msg)) {
         LOG(ERROR) << "Failed to build original BCP dependency graph: " << error_msg;
         return false;
@@ -2486,11 +2391,28 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
     }
 
+    // Load app dex files from APK first (before line 2490)
+    std::vector<std::unique_ptr<const art::DexFile>> app_dex_files;
+    if (args_->apk_file_ != nullptr) {
+      art::DexFileLoader loader(args_->apk_file_, args_->apk_file_);
+      bool success = loader.Open(
+          /*verify=*/true,
+          /*verify_checksum=*/true,
+          /*allow_no_dex_files=*/false,
+          &error_msg,
+          &app_dex_files);
+      if (!success || app_dex_files.empty()) {
+        LOG(ERROR) << "Failed to load DEX from APK: " << error_msg;
+        return false;
+      }
+      LOG(INFO) << "Loaded " << app_dex_files.size() << " DEX file(s) from APK";
+    }
+
     // Load OAT file first if provided (needed for filtering compiled methods)
     std::unique_ptr<OatFileAnalyzer> oat_analyzer;
     const DependencyGraphBuilder::CompiledMethodSet* compiled_methods = nullptr;
     if (args_->oat_file_) {
-      oat_analyzer.reset(new OatFileAnalyzer(args_->oat_file_));
+      oat_analyzer.reset(new OatFileAnalyzer(args_->oat_file_, app_dex_files));
       if (!oat_analyzer->LoadOatFile(&error_msg)) {
         LOG(ERROR) << "Failed to load OAT file: " << error_msg;
         return false;
@@ -2500,8 +2422,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
-    DependencyGraphBuilder graph_builder(args_->apk_file_, &graph, &interface_method_changes,
-                                          &string_id_changes, &type_id_changes, compiled_methods);
+    DependencyGraphBuilder graph_builder(&graph, app_dex_files, &interface_method_changes,
+                                          &string_id_changes, &type_id_changes);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
@@ -2509,27 +2431,19 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
     // Now precompute compiled methods using the dex files from graph_builder
     if (oat_analyzer != nullptr) {
-      if (!oat_analyzer->PrecomputeCompiledMethods(&graph_builder.GetDexFiles())) {
+      if (!oat_analyzer->PrecomputeCompiledMethods(nullptr)) {
         LOG(ERROR) << "Failed to precompute compiled methods";
         return false;
       }
       compiled_methods = &oat_analyzer->GetCompiledMethods();
       // Rebuild graph with compiled method filtering
-      DependencyGraph graph2;
-      DependencyGraphBuilder graph_builder2(args_->apk_file_, &graph2, &interface_method_changes,
-                                             nullptr, nullptr, compiled_methods); //modified
-      if (!graph_builder2.BuildGraph(&error_msg)) {
-        LOG(ERROR) << error_msg;
-        return false;
-      }
-      graph = std::move(graph2);
     }
 
     // Build inline call graph if OAT file is provided
     InlineCallGraph inline_call_graph;
     if (args_->oat_file_) {
       LOG(INFO) << "Building inline call graph from OAT file...";
-      OatFileAnalyzer oat_analyzer2(args_->oat_file_);
+      OatFileAnalyzer oat_analyzer2(args_->oat_file_, app_dex_files);
       if (!oat_analyzer2.LoadOatFile(&error_msg)) {
         LOG(ERROR) << "Failed to load OAT file: " << error_msg;
         return false;
@@ -2571,16 +2485,10 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
         // Build BCP method dependency graph and propagate to get affected BCP methods
         LOG(INFO) << "Building BCP method dependency graph for method change analysis...";
-        std::vector<const char*> original_bcp_jars;
-        std::vector<std::string> original_paths = BuildJarPaths(
-            args_->origin_bcp_prefix_, kBootClasspathJars);
-        for (const auto& path : original_paths) {
-          original_bcp_jars.push_back(path.c_str());
-        }
 
         // Use heap allocation to reduce stack usage
         std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
-        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_jars, bcp_method_graph.get(), &interface_method_changes, &string_id_changes, &type_id_changes);
+        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_dex_files, bcp_method_graph.get(), &interface_method_changes, &string_id_changes, &type_id_changes);
         if (!bcp_method_builder.BuildGraph(&error_msg)) {
           LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
           return false;

@@ -33,6 +33,8 @@
 #include "android-base/macros.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
+#include "arch/instruction_set.h"
+#include "base/indenter.h"
 #include "class_status.h"
 #include "cmdline.h"
 #include "dex/class_accessor-inl.h"
@@ -61,6 +63,8 @@
 #include "scoped_thread_state_change-inl.h"
 using namespace art;
 
+static std::vector<std::unique_ptr<const art::DexFile>>* g_bcp_dex_files;
+static std::vector<std::unique_ptr<const art::DexFile>>* g_app_dex_files;
 // Builds full JAR paths from a directory prefix and a vector of relative jar paths.
 // Ensure prefix ends with '/' before joining.
 static std::vector<std::string> BuildJarPaths(const std::string& prefix,
@@ -97,14 +101,31 @@ static bool LoadDexFilesFromJars(const std::vector<std::string>& jar_paths,
   return !out_dex_files->empty();
 }
 
-static void ATTRIBUTE_UNUSED PrintDexBytecode(const DexFile* dex_file,
+static void PrintDexBytecode(const ClassAccessor::Method& method) {
+  const dex::CodeItem* code_item = method.GetCodeItem();
+  if (code_item == nullptr) {
+    std::cout << "  DEX code: (native or abstract method)\n";
+    return;
+  }
+  const DexFile* dex_file = &method.GetDexFile();
+  std::cout << "  DEX code:" << dex_file->PrettyMethod(method.GetIndex()) <<"\n";
+  CodeItemDataAccessor code_accessor(*dex_file, code_item);
+  for (const DexInstructionPcPair& pair : code_accessor) {
+    const uint32_t dex_pc = pair.DexPc();
+    const Instruction* insn = &pair.Inst();
+    std::string disasm = insn->DumpString(dex_file);
+    printf("    %04x: %s\n", dex_pc * 2, disasm.c_str());
+  }
+  return;
+}
+
+static void PrintDexBytecode(const DexFile* dex_file,
                               uint16_t class_def_idx,
                               uint32_t method_idx) {
   if (dex_file == nullptr) {
     std::cout << "  DEX code: (no dex file)\n";
     return;
   }
-
   // Find the class
   if (class_def_idx >= dex_file->NumClassDefs()) {
     std::cout << "  DEX code: (class not found)\n";
@@ -117,20 +138,7 @@ static void ATTRIBUTE_UNUSED PrintDexBytecode(const DexFile* dex_file,
   // Find the method within this class
   for (ClassAccessor::Method method : accessor.GetMethods()) {
     if (method.GetIndex() == method_idx) {
-      const dex::CodeItem* code_item = method.GetCodeItem();
-      if (code_item == nullptr) {
-        std::cout << "  DEX code: (native or abstract method)\n";
-        return;
-      }
-
-      std::cout << "  DEX code:\n";
-      CodeItemDataAccessor code_accessor(*dex_file, code_item);
-      for (const DexInstructionPcPair& pair : code_accessor) {
-        const uint32_t dex_pc = pair.DexPc();
-        const Instruction* insn = &pair.Inst();
-        std::string disasm = insn->DumpString(dex_file);
-        printf("    %04x: %s\n", dex_pc * 2, disasm.c_str());
-      }
+      PrintDexBytecode(method);
       return;
     }
   }
@@ -729,7 +737,9 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
                 break;
               }
               case kDexInvokeSuper:
-              case kDexInvokeDirect:
+              case kDexInvokeDirect: {
+                break;
+              }
               case kDexInvokeStatic: {
                 auto method_idx = inst->VRegB();
                 const dex::MethodId& method_id = dex->GetMethodId(method_idx);
@@ -836,6 +846,16 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
               vertex.SetChange();
             }
           } else if (inst->Opcode() == Instruction::NEW_INSTANCE) {
+            auto type_idx = inst->VRegB();
+            const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
+            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
+            const char* class_descriptor = dex->GetStringData(name_id);
+            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+              graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
+              auto& vertex = graph_->graph_.get_vertex(vertex_id);
+              vertex.SetChange();
+            }
+          } else if (inst->Opcode() == Instruction::CHECK_CAST) {
             auto type_idx = inst->VRegB();
             const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
@@ -1978,6 +1998,7 @@ class InlineCallGraphBuilder {
   InlineCallGraphBuilder(InlineCallGraph* graph, const art::OatFile* oat_file, const std::vector<std::unique_ptr<const art::DexFile>>& dex_files) : graph_(*graph), oat_file_(*oat_file), dex_files_(dex_files) {}
   bool BuildGraph(ATTRIBUTE_UNUSED std::string* error_msg) {
     size_t dex_file_count = oat_file_.GetOatDexFiles().size();
+    CHECK_EQ(dex_file_count, dex_files_.size());
     for (size_t i = 0; i < dex_file_count; ++i) {
       const art::OatDexFile* oat_dex_file = oat_file_.GetOatDexFiles()[i];
       if (oat_dex_file == nullptr) {
@@ -1987,7 +2008,7 @@ class InlineCallGraphBuilder {
       const art::DexFile* dex_file = dex_files_[i].get();
       // Skip DEX location check because DEX files extracted from APK may not match OAT file's recorded location
       for (ClassAccessor accessor : dex_file->GetClasses()) {
-        const uint32_t class_def_index = accessor.GetClassDefIndex();
+        const uint16_t class_def_index = accessor.GetClassDefIndex();
         const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(class_def_index);
         uint32_t class_method_index = 0;
 
@@ -2031,15 +2052,30 @@ class InlineCallGraphBuilder {
           }
           uint32_t dex_method_idx = method.GetIndex();
           DexSymId caller_dex_sym_id(i, true, dex_method_idx);
-          AnalyzeOatMethod(method_header, caller_dex_sym_id);
+          std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
+          if (caller_method_name.find("com.google.protobuf.Descriptors$EnumDescriptor com.google.protobuf.DescriptorProtos$FieldOptions$JSType.getDescriptor()") != std::string::npos) {
+            std::cout<<caller_method_name<<"\n"; 
+            PrintDexBytecode(method);
+          }
+          AnalyzeOatMethod(method_header, caller_dex_sym_id, oat_method.GetCodeOffset());
         }
       }
     }
     return true;
   }
-  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id) {
+  bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id, uint32_t offset) {
+    bool should_print_inline_dex = false;
     CodeInfo code_info(caller_header);
     std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
+    if (caller_method_name.find("com.google.protobuf.Descriptors$EnumDescriptor com.google.protobuf.DescriptorProtos$FieldOptions$JSType.getDescriptor()") != std::string::npos) {
+      should_print_inline_dex = true;
+    }
+    if (should_print_inline_dex) {
+      VariableIndentationOutputStream vios(&std::cout);
+      for (const StackMap& stack_map : code_info.GetStackMaps()) {
+        stack_map.Dump(&vios, code_info, offset, InstructionSet::kArm64);
+      }
+    }
     for (const StackMap& stack_map : code_info.GetStackMaps()) {
       for (const InlineInfo& inline_info : code_info.GetInlineInfosOf(stack_map)) {
         MethodInfo method_info = code_info.GetMethodInfoOf(inline_info);
@@ -2070,6 +2106,21 @@ class InlineCallGraphBuilder {
         graaf::vertex_id_t vertex_id_caller = static_cast<graaf::vertex_id_t>(caller_dex_sym_id.id);
         // Create callee DexSymId: is_method = true, def_id = GetMethodIndex()
         DexSymId callee_dex_sym_id(dex_file_index, true, method_info.GetMethodIndex(), is_bcp_dex);
+        const DexFile* dex_file = nullptr;
+        if (is_bcp_dex) {
+          dex_file = (*g_bcp_dex_files)[dex_file_index].get();
+        } else {
+          dex_file = (*g_app_dex_files)[dex_file_index].get();
+        }
+        if (should_print_inline_dex) {
+          for (const ClassAccessor accessor:dex_file->GetClasses()) {
+            for (const ClassAccessor::Method& method:accessor.GetMethods()) {
+              if (method.GetIndex() == method_info.GetMethodIndex()) {
+                PrintDexBytecode(dex_file, accessor.GetClassDefIndex(), method.GetIndex());
+              }
+            }
+          }
+        }
 
         // Try to get method name
         std::string method_name;
@@ -2308,7 +2359,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         LOG(ERROR) << "No DEX files loaded from original boot classes directory";
         return false;
       }
-
+      g_bcp_dex_files = &original_bcp_dex_files;
       // Build original BCP dependency graph
       std::unique_ptr<BcpDependencyGraph> original_bcp_graph = std::make_unique<BcpDependencyGraph>();
       BcpDependencyGraphBuilder bcp_builder(original_bcp_dex_files, original_bcp_graph.get());
@@ -2394,6 +2445,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         LOG(ERROR) << "Failed to load DEX from APK: " << error_msg;
         return false;
       }
+      g_app_dex_files = &app_dex_files;
       LOG(INFO) << "Loaded " << app_dex_files.size() << " DEX file(s) from APK";
     }
 

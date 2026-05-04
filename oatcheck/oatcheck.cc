@@ -1155,6 +1155,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
             const dex::TypeId& remaining_type_id = origin_dex->GetTypeId(dex::TypeIndex(remaining_idx));
             const char* remaining_desc = origin_dex->GetStringData(origin_dex->GetStringId(remaining_type_id.descriptor_idx_));
             type_id_changes_.insert(std::string(remaining_desc));
+            LOG(INFO) << "Tpy "<<remaining_idx << " :" << remaining_desc;
           }
           break;
         }
@@ -2466,7 +2467,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     // Build app dependency graph with interface method changes from BCP diff
     DependencyGraph graph;
     DependencyGraphBuilder graph_builder(&graph, app_dex_files, &interface_method_changes,
-                                          &string_id_changes, &type_id_changes);
+                                          nullptr, nullptr);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;

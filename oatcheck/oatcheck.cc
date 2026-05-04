@@ -554,6 +554,7 @@ class BcpDependencyGraph : public DependencyGraph {
 
 // Base class for building dependency graphs from DEX files.
 // Extracts common members and methods from BcpDependencyGraphBuilder and DependencyGraphBuilder.
+template <bool is_handling_bcp>
 class DependencyGraphBuilderBase {
  public:
   virtual ~DependencyGraphBuilderBase() = default;
@@ -653,7 +654,8 @@ class DependencyGraphBuilderBase {
 
 // Intermediate base class for builders that analyze methods (as opposed to just class dependencies).
 // Inherits from DependencyGraphBuilderBase and adds common method analysis logic.
-class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
+template<bool is_handling_bcp>
+class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase<is_handling_bcp> {
  public:
   virtual ~DependencyGraphBuilderWithMethods() = default;
 
@@ -666,8 +668,8 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
   bool BuildGraph(std::string* error_msg) override {
     size_t i = 0;
     // Step 1: Build descriptor -> DexSymId mapping for all dex files
-    for (const auto& dex : dex_files_) {
-      if (!BuildDescriptorMapping(dex.get(), i, graph_)) {
+    for (const auto& dex : this->dex_files_) {
+      if (!this->BuildDescriptorMapping(dex.get(), i, graph_)) {
         LOG(ERROR) << "Failed to build descriptor mapping: " << *error_msg;
         return false;
       }
@@ -675,12 +677,12 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
     }
     // Step 2: Analyze classes and methods using the mapping
     i = 0;
-    for (const auto& dex : dex_files_) {
+    for (const auto& dex : this->dex_files_) {
       if (!AnalyzeDexMethods(dex.get(), i, error_msg)) {
         LOG(ERROR) << "Failed to analyze DEX methods: " << *error_msg;
         return false;
       }
-      if (!BuildDependencyEdges(dex.get(), i, graph_)) {
+      if (!this->BuildDependencyEdges(dex.get(), i, graph_)) {
         LOG(ERROR) << "Failed to build dependency edges: " << *error_msg;
         return false;
       }
@@ -692,7 +694,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
 
  protected:
   DependencyGraphBuilderWithMethods(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files)
-      : DependencyGraphBuilderBase(dex_files) {}
+      : DependencyGraphBuilderBase<is_handling_bcp>(dex_files) {}
   DependencyGraph* graph_ = nullptr;
   // Interface method changes from BCP diff: interface_descriptor -> set of changed method keys
   const InterfaceMethodChanges* interface_method_changes_ = nullptr;
@@ -714,7 +716,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
 
         const art::CodeItemInstructionAccessor& code = method.GetInstructions();
         std::string method_name(dex->PrettyMethod(method.GetIndex()));
-        DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex());
+        DexSymId method_dex_sym_id(dex_file_idx, true, method.GetIndex(), is_handling_bcp);
         graph_->AddVertexIfAbsent(method_dex_sym_id, method_name, false);
 
         for (auto it = code.begin(); it != code.end(); it++) {
@@ -728,7 +730,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
                 const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
                 const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
                 const char* class_descriptor = dex->GetStringData(name_id);
-                DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+                DexSymId class_dex_sym_id = this->GetOrCreateDexSymId(class_descriptor);
                 graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
                 graph_->UpdateEdge(
                     class_dex_sym_id,
@@ -783,7 +785,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
                 }
 
                 // Create edge for interface dependency
-                DexSymId interface_dex_sym_id = GetOrCreateDexSymId(interface_descriptor);
+                DexSymId interface_dex_sym_id = this->GetOrCreateDexSymId(interface_descriptor);
                 graph_->AddVertexIfAbsent(interface_dex_sym_id, interface_descriptor, false);
                 graph_->UpdateEdge(
                     interface_dex_sym_id,
@@ -803,7 +805,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
-            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+            DexSymId class_dex_sym_id = this->GetOrCreateDexSymId(class_descriptor);
             graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
             graph_->UpdateEdge(
                 class_dex_sym_id,
@@ -820,7 +822,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
             }
-            DexSymId class_dex_sym_id = GetOrCreateDexSymId(class_descriptor);
+            DexSymId class_dex_sym_id = this->GetOrCreateDexSymId(class_descriptor);
             graph_->AddVertexIfAbsent(class_dex_sym_id, class_descriptor, false);
             graph_->UpdateEdge(
                 class_dex_sym_id,
@@ -873,7 +875,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase {
   }
 };
 
-class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
+class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase<true> {
  public:
   BcpDependencyGraphBuilder(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files,
                              BcpDependencyGraph* bcp_graph)
@@ -916,7 +918,7 @@ class BcpDependencyGraphBuilder : public DependencyGraphBuilderBase {
 
 // BCP method dependency graph builder - reuses DependencyGraphBuilder logic
 // but processes ALL BCP methods (not filtered by compiled methods)
-class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
+class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods<true> {
  public:
   BcpMethodDependencyGraphBuilder(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files,
                                  DependencyGraph* graph,
@@ -939,7 +941,7 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods
 
 };
 
-class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods {
+class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods<false> {
  public:
   using CompiledMethodSet = std::set<uint64_t>;
 

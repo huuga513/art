@@ -2432,13 +2432,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     InlineCallGraph inline_call_graph;
     if (args_->oat_file_) {
       LOG(INFO) << "Building inline call graph from OAT file...";
-      OatFileAnalyzer oat_analyzer2(args_->oat_file_, app_dex_files);
-      if (!oat_analyzer2.LoadOatFile(&error_msg)) {
-        LOG(ERROR) << "Failed to load OAT file: " << error_msg;
-        return false;
-      }
       InlineCallGraphBuilder inline_graph_builder(&inline_call_graph,
-                                                 oat_analyzer2.GetOatFile(),
+                                                 oat_analyzer->GetOatFile(),
                                                  graph_builder.GetDexFiles());
       if (!inline_graph_builder.BuildGraph(&error_msg)) {
         LOG(ERROR) << "Failed to build inline call graph: " << error_msg;

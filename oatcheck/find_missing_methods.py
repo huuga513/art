@@ -26,7 +26,12 @@ def main():
         if match:
             result_methods = int(match.group(1))
             break
-
+    compiled_methods = 0
+    for line in result_content.split('\n'):
+        match = re.match(r'.*Precomputed (\d+) compiled methods from OAT file', line)
+        if match:
+            compiled_methods = int(match.group(1))
+            break
     # Parse diff file and find missing methods
     diff_methods = []
     with open(diff_file, 'r') as f:
@@ -42,7 +47,7 @@ def main():
     # Output results
     if missing:
         print(f"Found {len(missing)} methods in diff but not in result:")
-        for line_num, method_sig, _ in missing:
+        for line_num, method_sig in missing:
             print(f"Line {line_num}: {method_sig}")
     else:
         print("All diff methods found in result")
@@ -51,6 +56,8 @@ def main():
     if result_methods > 0:
         ratio = (len(diff_methods) / result_methods) * 100
         print(f"diff/result = {len(diff_methods)} / {result_methods} = {ratio:.2f}%")
+        ratio = (result_methods/compiled_methods) * 100
+        print(f"result/compiled_methods = {result_methods} / {compiled_methods} = {ratio:.2f}%")
     else:
         print("diff/result = N/A (result_methods is 0)")
 

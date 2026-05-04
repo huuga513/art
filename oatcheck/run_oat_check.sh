@@ -7,6 +7,9 @@ OATCHECK_DIR="/ssd2/wyz/AOSP/art/oatcheck"
 
 for app in "$BASE_DIR/$NEW_VER"/*/; do
     app_name=$(basename "$app")
+    #if [ "$app_name" != "com.ss.android.article.news" ]; then
+        #continue
+    #fi
     echo "===== Processing $app_name ====="
 
     fixed_oat="$BASE_DIR/$NEW_VER/$app_name/oat/base.odex"

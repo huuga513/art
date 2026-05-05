@@ -195,12 +195,11 @@ struct DexSymId {
   // Bit  63: is in bcp
   // Bit  62: is method (1 = method, 0 = class)
   // Bits 61-40: unused (reserved)
-  // Bits 39-32: dex file index (0-255), 0xFF indicates external class
+  // Bits 39-32: dex file index (0-255)
   // Bits 31-0: def_id - class_def_id when is_method=false, method_def_id when is_method=true
   //
   // For class: is_method = 0, def_id = class_def_id
   // For method: is_method = 1, def_id = method_def_id
-  // For external class: dex_file_index = 0xFF
   void SetIsBcpDex(bool is_bcp_dex) {
     if (is_bcp_dex) {
         id |= (uint64_t(1) << 63);
@@ -237,10 +236,6 @@ struct DexSymId {
   // Returns true if this is a class (is_method == false)
   bool IsClass() const {
     return !IsMethod();
-  }
-  // Returns true if this represents an external class (dex_file_index == 0xFF)
-  bool IsExternalClass() const {
-    return GetDexFileIndex() == 0xFF;
   }
   DexSymId(uint32_t dex_file_index, bool is_method, uint32_t def_id, bool is_bcp_dex = false) : id(0) {
     SetDexFileIndex(dex_file_index);
@@ -523,12 +518,12 @@ class BcpDependencyGraph : public DependencyGraph {
   }
 
   // Check if DexSymId is valid (within bounds)
-  // Returns false for external classes (dex_file_index = 0xFF)
+  // Returns false for external classes
   bool HasClassAccessor(const DexSymId& dex_sym_id) const {
     uint32_t dex_file_index = dex_sym_id.GetDexFileIndex();
     uint32_t class_def_index = dex_sym_id.GetDefId();
 
-    // External class marker (0xFF) is not valid for ClassAccessor
+    // External class is not valid for ClassAccessor
     if (dex_sym_id.IsBcpDex()) {
       return false;
     }
@@ -575,7 +570,7 @@ class DependencyGraphBuilderBase {
   std::unordered_map<std::string, DexSymId> descriptor_to_symid_;
 
   // Counter for assigning unique sym_ids to external classes
-  uint32_t external_class_counter_ = 0;
+  uint64_t external_class_counter_ = 0;
 
   DependencyGraphBuilderBase(const std::vector<std::unique_ptr<const art::DexFile>>& dex_files)
       : dex_files_(dex_files) {}
@@ -606,14 +601,16 @@ class DependencyGraphBuilderBase {
 
   // Get or create DexSymId for a descriptor.
   // If found in mapping, returns existing DexSymId.
-  // If not found, creates external DexSymId (dex_file_index = 0xFF, unique sym_id) and stores it.
+  // If not found, creates external DexSymId (is_bcp_dex = true, unique dex_id + sym_id) and stores it.
   DexSymId GetOrCreateDexSymId(const std::string& descriptor) {
     auto it = descriptor_to_symid_.find(descriptor);
     if (it != descriptor_to_symid_.end()) {
       return it->second;
     }
-    // Not found - create external class marker (dex_file_index = 0xFF, unique sym_id)
-    DexSymId external_symid(0xFF, false, external_class_counter_); // TODO: fix me
+    // Not found - create external class marker
+    uint32_t unique_external_class_def_id = static_cast<uint32_t>(external_class_counter_);
+    uint8_t unique_external_dex_file_index = static_cast<uint8_t>(external_class_counter_>>32);
+    DexSymId external_symid(unique_external_dex_file_index, false, unique_external_class_def_id, true);
     // Check if this external class is actually in the boot classpath
     if (IsBootClasspathClass(descriptor)) {
       external_symid.SetIsBcpDex(true);
@@ -1155,7 +1152,6 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
             const dex::TypeId& remaining_type_id = origin_dex->GetTypeId(dex::TypeIndex(remaining_idx));
             const char* remaining_desc = origin_dex->GetStringData(origin_dex->GetStringId(remaining_type_id.descriptor_idx_));
             type_id_changes_.insert(std::string(remaining_desc));
-            LOG(INFO) << "Tpy "<<remaining_idx << " :" << remaining_desc;
           }
           break;
         }

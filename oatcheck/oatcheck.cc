@@ -177,11 +177,21 @@ struct InterfaceMethodDiff {
 // Key: interface_descriptor, Value: set of "method_name:signature" that changed
 using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_set<std::string>>;
 
-// String ID changes: set of string contents whose IDs changed between old and new BCP
-using StringIdChanges = std::unordered_set<std::string>;
+// String ID changes: set of (dex_file_idx, string_id_idx) tuples whose IDs changed between old and new BCP
+struct StringIdChangeHash {
+  size_t operator()(const std::pair<size_t, uint32_t>& p) const noexcept {
+    return p.first * 31 + p.second;
+  }
+};
+using StringIdChanges = std::unordered_set<std::pair<size_t, uint32_t>, StringIdChangeHash>;
 
-// Type ID changes: set of type descriptors whose type IDs changed between old and new BCP
-using TypeIdChanges = std::unordered_set<std::string>;
+// Type ID changes: set of (dex_file_idx, type_id_idx) tuples whose IDs changed between old and new BCP
+struct TypeIdChangeHash {
+  size_t operator()(const std::pair<size_t, uint32_t>& p) const noexcept {
+    return p.first * 31 + p.second;
+  }
+};
+using TypeIdChanges = std::unordered_set<std::pair<size_t, uint32_t>, TypeIdChangeHash>;
 
 // Global counters for statistics (will be removed later)
 static size_t g_interface_affected_methods = 0;
@@ -742,10 +752,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase<is_h
               case kDexInvokeStatic: {
                 auto method_idx = inst->VRegB();
                 const dex::MethodId& method_id = dex->GetMethodId(method_idx);
-                const dex::TypeId& type_id = dex->GetTypeId(method_id.class_idx_);
-                const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-                const char* class_descriptor = dex->GetStringData(name_id);
-                if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+                if (is_handling_bcp && type_id_changes_ != nullptr && type_id_changes_->find({dex_file_idx, method_id.class_idx_.index_}) != type_id_changes_->end()) {
                   graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
                   auto& vertex = graph_->graph_.get_vertex(vertex_id);
                   vertex.SetChange();
@@ -814,7 +821,7 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase<is_h
             const dex::TypeId& type_id = dex->GetTypeId(field_id.class_idx_);
             const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
             const char* class_descriptor = dex->GetStringData(name_id);
-            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+            if (is_handling_bcp && type_id_changes_ != nullptr && type_id_changes_->find({dex_file_idx, field_id.class_idx_.index_}) != type_id_changes_->end()) {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
@@ -827,39 +834,28 @@ class DependencyGraphBuilderWithMethods : public DependencyGraphBuilderBase<is_h
                 std::bitset<3>(1 << static_cast<size_t>(DependencyType::kStaticFieldLayout)));
           } else if (inst->Opcode() == Instruction::CONST_STRING || inst->Opcode() == Instruction::CONST_STRING_JUMBO) {
             auto string_idx = inst->VRegB();
-            const dex::StringId& str_id = dex->GetStringId(dex::StringIndex(string_idx));
-            const char* string_data = dex->GetStringData(str_id);
-            if (string_id_changes_ != nullptr && string_id_changes_->find(string_data) != string_id_changes_->end()) {
+            if (is_handling_bcp && string_id_changes_ != nullptr && string_id_changes_->find({dex_file_idx, string_idx}) != string_id_changes_->end()) {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
             }
           } else if (inst->Opcode() == Instruction::CONST_CLASS) {
             auto type_idx = inst->VRegB();
-            const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+            if (is_handling_bcp && type_id_changes_ != nullptr && type_id_changes_->find({dex_file_idx, type_idx}) != type_id_changes_->end()) {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
             }
           } else if (inst->Opcode() == Instruction::NEW_INSTANCE) {
             auto type_idx = inst->VRegB();
-            const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+            if (is_handling_bcp && type_id_changes_ != nullptr && type_id_changes_->find({dex_file_idx, type_idx}) != type_id_changes_->end()) {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
             }
           } else if (inst->Opcode() == Instruction::CHECK_CAST) {
             auto type_idx = inst->VRegB();
-            const dex::TypeId& type_id = dex->GetTypeId(dex::TypeIndex(type_idx));
-            const dex::StringId& name_id = dex->GetStringId(type_id.descriptor_idx_);
-            const char* class_descriptor = dex->GetStringData(name_id);
-            if (type_id_changes_ != nullptr && type_id_changes_->find(class_descriptor) != type_id_changes_->end()) {
+            if (is_handling_bcp && type_id_changes_ != nullptr && type_id_changes_->find({dex_file_idx, type_idx}) != type_id_changes_->end()) {
               graaf::vertex_id_t vertex_id = static_cast<graaf::vertex_id_t>(method_dex_sym_id.id);
               auto& vertex = graph_->graph_.get_vertex(vertex_id);
               vertex.SetChange();
@@ -986,7 +982,6 @@ class DependencyGraphPropagator {
       if (!dex_sym_id.IsClass()) {
         continue;
       }
-
       const std::string& class_descriptor = vertex.GetDescriptor();
 
       // Check if this class is in the changed BCP classes
@@ -1121,8 +1116,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
           // Add all remaining strings from this position
           LOG(INFO) << "first diff:" << str_idx;
           for (uint32_t remaining_idx = str_idx; remaining_idx < origin_str_count; ++remaining_idx) {
-            const char* remaining_str = origin_dex->GetStringData(origin_dex->GetStringId(dex::StringIndex(remaining_idx)));
-            string_id_changes_.insert(std::string(remaining_str));
+            string_id_changes_.insert({i, remaining_idx});
           }
           break;  // No need to check further, all remaining strings are already added
         }
@@ -1149,9 +1143,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         if (strcmp(origin_desc, new_desc) != 0) {
           // Type at this index differs - this type and all subsequent types have changed IDs
           for (uint32_t remaining_idx = type_idx; remaining_idx < origin_type_count; ++remaining_idx) {
-            const dex::TypeId& remaining_type_id = origin_dex->GetTypeId(dex::TypeIndex(remaining_idx));
-            const char* remaining_desc = origin_dex->GetStringData(origin_dex->GetStringId(remaining_type_id.descriptor_idx_));
-            type_id_changes_.insert(std::string(remaining_desc));
+            type_id_changes_.insert({i, remaining_idx});
           }
           break;
         }

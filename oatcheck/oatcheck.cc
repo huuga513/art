@@ -934,6 +934,33 @@ class BcpMethodDependencyGraphBuilder : public DependencyGraphBuilderWithMethods
   }
 
 };
+class InlineCallGraphNode {
+ public:
+  InlineCallGraphNode(const std::string_view descriptor, bool is_effected) : descriptor_(descriptor), is_effected_(is_effected) {}
+
+  const std::string_view GetDescriptor() const { return descriptor_; }
+  bool IsEffected() const { return is_effected_; }
+  void SetEffected(bool is_effected) { is_effected_ = is_effected; }  
+ private:
+  std::string descriptor_;
+  bool is_effected_;
+};
+class InlineCallGraphEdge {
+ public:
+  InlineCallGraphEdge() = default;
+ private:
+  // No additional data for now.
+};
+
+class InlineCallGraph: public GraphBase<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::DIRECTED> {
+ public:
+  friend class InlineCallGraphBuilder;
+  friend class InlineDependencyExpander;
+
+  bool Contains(DexSymId dex_sym_id) const {
+    return graph_.has_vertex(static_cast<graaf::vertex_id_t>(dex_sym_id.id));
+  }
+};
 
 class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods<false> {
  public:
@@ -951,16 +978,22 @@ class DependencyGraphBuilder : public DependencyGraphBuilderWithMethods<false> {
     type_id_changes_ = type_id_changes;
   }
 
-  bool ShouldProcessMethod(ATTRIBUTE_UNUSED size_t dex_file_idx,
-                           ATTRIBUTE_UNUSED uint16_t class_def_index,
-                           ATTRIBUTE_UNUSED uint32_t method_index) override {
-    return true;
-    //if (compiled_methods_ == nullptr || compiled_methods_->empty()) {
-      //return true;
-    //}
-    //return compiled_methods_->find({dex_file_idx, class_def_index, method_index}) != compiled_methods_->end();
+  void SetInlineCallGraph(const InlineCallGraph* inline_call_graph) {
+    inline_call_graph_ = inline_call_graph;
   }
 
+  bool ShouldProcessMethod(size_t dex_file_idx,
+                           ATTRIBUTE_UNUSED uint16_t class_def_index,
+                           uint32_t method_index) override {
+    if (inline_call_graph_ == nullptr) {
+      return true;
+    }
+    DexSymId method_sym_id(dex_file_idx, true, method_index, false);
+    return inline_call_graph_->Contains(method_sym_id);
+  }
+
+ private:
+  const InlineCallGraph* inline_call_graph_ = nullptr;
 };
 
 class DependencyGraphPropagator {
@@ -1857,29 +1890,6 @@ class OatFileAnalyzer {
   DependencyGraphBuilder::CompiledMethodSet compiled_methods_;
 };
 
-class InlineCallGraphNode {
- public:
-  InlineCallGraphNode(const std::string_view descriptor, bool is_effected) : descriptor_(descriptor), is_effected_(is_effected) {}
-
-  const std::string_view GetDescriptor() const { return descriptor_; }
-  bool IsEffected() const { return is_effected_; }
-  void SetEffected(bool is_effected) { is_effected_ = is_effected; }  
- private:
-  std::string descriptor_;
-  bool is_effected_;
-};
-class InlineCallGraphEdge {
- public:
-  InlineCallGraphEdge() = default;
- private:
-  // No additional data for now.
-};
-class InlineCallGraph: public GraphBase<InlineCallGraphNode, InlineCallGraphEdge, graaf::graph_type::DIRECTED> {
- public:
-  friend class InlineCallGraphBuilder;
-  friend class InlineDependencyExpander;
-};
-
 // InlineDependencyExpander propagates dependencies through the inline call graph.
 // For each inline edge A → B (method A inlines method B), and for each
 // dependency edge B → C in the dependency graph, this class creates a new graph
@@ -2471,10 +2481,28 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Precompute compiled methods after dex files are loaded in DependencyGraphBuilder
     }
 
+    // Build inline call graph first (if OAT file is provided) - needed for ShouldProcessMethod filtering
+    InlineCallGraph inline_call_graph;
+    if (args_->oat_file_) {
+      LOG(INFO) << "Building inline call graph from OAT file...";
+      InlineCallGraphBuilder inline_graph_builder(&inline_call_graph,
+                                                 oat_analyzer != nullptr ? oat_analyzer->GetOatFile() : nullptr,
+                                                 app_dex_files);
+      if (!inline_graph_builder.BuildGraph(&error_msg)) {
+        LOG(ERROR) << "Failed to build inline call graph: " << error_msg;
+        return false;
+      }
+      LOG(INFO) << "Inline call graph built: "
+                << inline_call_graph.graph_.vertex_count() << " vertices, "
+                << inline_call_graph.graph_.edge_count() << " edges";
+    }
+
     // Build app dependency graph with interface method changes from BCP diff
+    // and inline call graph filtering (ShouldProcessMethod will check inline call graph)
     DependencyGraph graph;
     DependencyGraphBuilder graph_builder(&graph, app_dex_files, &interface_method_changes,
                                           nullptr, nullptr);
+    graph_builder.SetInlineCallGraph(&inline_call_graph);
     if (!graph_builder.BuildGraph(&error_msg)) {
       LOG(ERROR) << error_msg;
       return false;
@@ -2490,22 +2518,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       // Rebuild graph with compiled method filtering
     }
 
-    // Build inline call graph if OAT file is provided
-    InlineCallGraph inline_call_graph;
+    // Expand dependencies through inline call graph
     if (args_->oat_file_) {
-      LOG(INFO) << "Building inline call graph from OAT file...";
-      InlineCallGraphBuilder inline_graph_builder(&inline_call_graph,
-                                                 oat_analyzer->GetOatFile(),
-                                                 graph_builder.GetDexFiles());
-      if (!inline_graph_builder.BuildGraph(&error_msg)) {
-        LOG(ERROR) << "Failed to build inline call graph: " << error_msg;
-        return false;
-      }
-      LOG(INFO) << "Inline call graph built: "
-                << inline_call_graph.graph_.vertex_count() << " vertices, "
-                << inline_call_graph.graph_.edge_count() << " edges";
-
-      // Expand dependencies through inline call graph
       LOG(INFO) << "Expanding dependencies through inline call graph...";
       InlineDependencyExpander expander(&graph, &inline_call_graph);
       DependencyGraph expanded_graph;

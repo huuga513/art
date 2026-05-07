@@ -1393,7 +1393,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     //  b. if number of virtual methods stay the same, then any of new virtual method doesnt match corresponding old instance field
 
     static int changed_class_count = 0;
-    const int kMaxPrintedChanges = 5;
+    const int kMaxPrintedChanges = 10;
 
     DependencyGraphNode& vertex = bcp_graph_.graph_.get_vertex(static_cast<graaf::vertex_id_t>(old_dex_sym_id.id));
 
@@ -2044,10 +2044,10 @@ class InlineCallGraphBuilder {
           uint32_t dex_method_idx = method.GetIndex();
           DexSymId caller_dex_sym_id(i, true, dex_method_idx);
           std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
-          if (caller_method_name.find("com.google.protobuf.Descriptors$EnumDescriptor com.google.protobuf.DescriptorProtos$FieldOptions$JSType.getDescriptor()") != std::string::npos) {
-            std::cout<<caller_method_name<<"\n"; 
-            PrintDexBytecode(method);
-          }
+          //if (caller_method_name.find("org.bouncycastle.cert.X509CertificateHolder.get") != std::string::npos) {
+            //std::cout<<caller_method_name<<"\n"; 
+            //PrintDexBytecode(method);
+          //}
           AnalyzeOatMethod(method_header, caller_dex_sym_id, oat_method.GetCodeOffset());
         }
       }
@@ -2058,9 +2058,9 @@ class InlineCallGraphBuilder {
     bool should_print_inline_dex = false;
     CodeInfo code_info(caller_header);
     std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
-    if (caller_method_name.find("com.google.protobuf.Descriptors$EnumDescriptor com.google.protobuf.DescriptorProtos$FieldOptions$JSType.getDescriptor()") != std::string::npos) {
-      should_print_inline_dex = true;
-    }
+    //if (caller_method_name.find("org.bouncycastle.cert.X509CertificateHolder.get") != std::string::npos) {
+      //should_print_inline_dex = true;
+    //}
     if (should_print_inline_dex) {
       VariableIndentationOutputStream vios(&std::cout);
       for (const StackMap& stack_map : code_info.GetStackMaps()) {
@@ -2410,7 +2410,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
           } else {
             changed_classes++;
           }
-          if (args_->verbose_) {
+          if (true /*args_->verbose_*/) {
             LOG(INFO) << "Changed: " << vertex.GetDescriptor();
           }
         }
@@ -2556,11 +2556,11 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         }
 
         size_t printed_class_count = 0;
-        //for (const auto& [class_desc, changes] : affected_class_details) {
-          //LOG(INFO) << "=== APP Affected Class #" << (printed_class_count + 1) << " ===";
-          ////LOG(INFO) << "Class: " << class_desc;
-          //printed_class_count++;
-        //}
+        for (const auto& [class_desc, changes] : affected_class_details) {
+          LOG(INFO) << "=== APP Affected Class #" << (printed_class_count + 1) << " ===";
+          LOG(INFO) << "Class: " << class_desc;
+          printed_class_count++;
+        }
         if (!affected_class_details.empty()) {
           LOG(INFO) << "Printed " << printed_class_count << " affected APP classes (first 20 of " << affected_class_details.size() << " total)";
         }

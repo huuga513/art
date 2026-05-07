@@ -652,7 +652,7 @@ class DependencyGraphBuilderBase {
         // Add vertex for superclass (if external, still need vertex for graph completeness)
         graph->AddVertexIfAbsent(superclass_dex_sym_id, superclass_descriptor, false);
         // Edge from superclass to subclass: subclass depends on superclass
-        graph->UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(7));
+        graph->UpdateEdge(superclass_dex_sym_id, class_dex_sym_id, std::bitset<3>(6));
       }
     }
     return true;

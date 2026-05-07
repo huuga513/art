@@ -67,9 +67,9 @@ static std::vector<std::unique_ptr<const art::DexFile>>* g_bcp_dex_files;
 static std::vector<std::unique_ptr<const art::DexFile>>* g_app_dex_files;
 // Builds full JAR paths from a directory prefix and a vector of relative jar paths.
 // Ensure prefix ends with '/' before joining.
-static std::vector<std::string> BuildJarPaths(const std::string& prefix,
+static std::vector<std::string> BuildJarPaths(std::string_view prefix,
                                                const std::vector<std::string>& jar_relative_paths) {
-  std::string normalized_prefix = prefix;
+  std::string normalized_prefix(prefix);
   if (!normalized_prefix.empty() && normalized_prefix.back() != '/') {
     normalized_prefix += '/';
   }
@@ -164,7 +164,7 @@ struct MethodChangeDetail {
   std::string old_sig;  // empty if kAdded
   std::string new_sig;  // empty if kDeleted
 
-  MethodChangeDetail(MethodChangeType t, const std::string& name, const std::string& old_s, const std::string& new_s)
+  MethodChangeDetail(MethodChangeType t, const std::string_view name, const std::string_view old_s, const std::string_view new_s)
       : type(t), method_name(name), old_sig(old_s), new_sig(new_s) {}
 };
 
@@ -175,7 +175,7 @@ struct InterfaceMethodDiff {
 
 // Interface method change: independent change tracking for invoke-interface
 // Key: interface_descriptor, Value: set of "method_name:signature" that changed
-using InterfaceMethodChanges = std::unordered_map<std::string, std::unordered_set<std::string>>;
+using InterfaceMethodChanges = std::unordered_map<std::string_view, std::unordered_set<std::string>>;
 
 // String ID changes: set of (dex_file_idx, string_id_idx) tuples whose IDs changed between old and new BCP
 struct StringIdChangeHash {
@@ -261,10 +261,10 @@ struct DexSymId {
 
 class DependencyGraphNode {
  public:
-  DependencyGraphNode(std::string descriptor, bool is_changed = false)
-      : descriptor_(std::move(descriptor)), changes_(is_changed) {}
+  DependencyGraphNode(std::string_view descriptor, bool is_changed = false)
+      : descriptor_(descriptor), changes_(is_changed) {}
 
-  const std::string& GetDescriptor() const { return descriptor_; }
+  const std::string_view GetDescriptor() const { return descriptor_; }
   bool IsChanged() const { return changes_.any(); }
 
   std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)> GetChanges() const {
@@ -388,7 +388,7 @@ class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge
   // Dump all successor nodes of a given class descriptor
   // Edge direction: class -> method (method depends on class)
   // Successors are nodes that the given class points to (i.e., methods depending on this class)
-  void DumpSuccessors(const std::string& class_descriptor) const {
+  void DumpSuccessors(const std::string_view class_descriptor) const {
     LOG(INFO) << "=== Successors of " << class_descriptor << " ===";
     size_t count = 0;
     for (const auto& [vertex_id, vertex] : graph_.get_vertices()) {
@@ -413,7 +413,7 @@ class DependencyGraph: public GraphBase<DependencyGraphNode, DependencyGraphEdge
   // Edge direction: class -> method (method depends on class)
   // Ancestors are nodes that the given node depends on (predecessors in the graph)
   // Uses reverse adjacency: find all successors in the reversed graph.
-  void DumpAncestors(const std::string& target_descriptor) const {
+  void DumpAncestors(const std::string_view target_descriptor) const {
     LOG(INFO) << "=== Ancestors of " << target_descriptor << " ===";
 
     // First, try exact match
@@ -577,7 +577,7 @@ class DependencyGraphBuilderBase {
 
   // Descriptor -> DexSymId mapping for O(1) lookup
   // This maps class descriptors to their DexSymId (using class_def_index)
-  std::unordered_map<std::string, DexSymId> descriptor_to_symid_;
+  std::unordered_map<std::string_view, DexSymId> descriptor_to_symid_;
 
   // Counter for assigning unique sym_ids to external classes
   uint64_t external_class_counter_ = 0;
@@ -612,7 +612,7 @@ class DependencyGraphBuilderBase {
   // Get or create DexSymId for a descriptor.
   // If found in mapping, returns existing DexSymId.
   // If not found, creates external DexSymId (is_bcp_dex = true, unique dex_id + sym_id) and stores it.
-  DexSymId GetOrCreateDexSymId(const std::string& descriptor) {
+  DexSymId GetOrCreateDexSymId(const std::string_view descriptor) {
     auto it = descriptor_to_symid_.find(descriptor);
     if (it != descriptor_to_symid_.end()) {
       return it->second;
@@ -971,7 +971,7 @@ class DependencyGraphPropagator {
   // Set initial changes on app dependency graph based on changed BCP classes.
   // Takes the changed class info from BCP diff and marks corresponding nodes in the graph.
   void SetInitialChangesFromBcp(
-      const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info) {
+      const std::unordered_map<std::string_view, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info) {
     size_t initial_changed_nodes = 0;
 
     // Iterate through all vertices in the graph
@@ -982,7 +982,7 @@ class DependencyGraphPropagator {
       if (!dex_sym_id.IsClass()) {
         continue;
       }
-      const std::string& class_descriptor = vertex.GetDescriptor();
+      const std::string_view class_descriptor = vertex.GetDescriptor();
 
       // Check if this class is in the changed BCP classes
       auto it = changed_class_info.find(class_descriptor);
@@ -1181,7 +1181,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
         continue;
       }
 
-      const std::string& class_descriptor = vertex.GetDescriptor();
+      std::string_view class_descriptor = vertex.GetDescriptor();
 
       // O(1) lookup using preprocessed map
       const art::DexFile* found_dex = nullptr;
@@ -1361,7 +1361,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
 
  private:
   // Find a class by descriptor using preprocessed lookup table (O(1))
-  bool FindClassInNewDexFiles(const std::string& descriptor,
+  bool FindClassInNewDexFiles(const std::string_view descriptor,
                               const art::DexFile** out_dex,
                               uint32_t* out_class_def_idx) const {
     auto it = class_lookup_.find(descriptor);
@@ -1538,7 +1538,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
     if (static_fields_changed || instance_fields_changed || vtable_changed) {
       if (changed_class_count < kMaxPrintedChanges || vertex.GetDescriptor() == "Landroid/view/View;") {
         changed_class_count++;
-        const std::string& class_descriptor = vertex.GetDescriptor();
+        const std::string_view class_descriptor = vertex.GetDescriptor();
         LOG(INFO) << "=== Class Change #" << changed_class_count << " ===";
         LOG(INFO) << "Class: " << class_descriptor;
 
@@ -1568,7 +1568,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   const std::vector<std::unique_ptr<const art::DexFile>>& updated_boot_dex_files_;
 
   // Preprocessed lookup: descriptor -> (DexFile*, class_def_idx)
-  std::unordered_map<std::string, std::pair<const art::DexFile*, uint32_t>> class_lookup_;
+  std::unordered_map<std::string_view, std::pair<const art::DexFile*, uint32_t>> class_lookup_;
 
   // Interface method changes: interface_descriptor -> set of changed method keys
   InterfaceMethodChanges interface_method_changes_;
@@ -1580,11 +1580,11 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   TypeIdChanges type_id_changes_;
 
   // Detailed interface method diffs: interface_descriptor -> detailed diff (for printing)
-  std::map<std::string, InterfaceMethodDiff> interface_method_diffs_;
+  std::map<std::string_view, InterfaceMethodDiff> interface_method_diffs_;
 
   // Changed class info: class_descriptor -> bitset of change types
   // This is used to propagate changes to the app dependency graph
-  std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info_;
+  std::unordered_map<std::string_view, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info_;
 
  public:
   // Collect all changed classes after propagation.
@@ -1602,7 +1602,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
       }
       // Check if this class has any changes (directly or through propagation)
       if (vertex.IsChanged()) {
-        const std::string& class_descriptor = vertex.GetDescriptor();
+        const std::string_view class_descriptor = vertex.GetDescriptor();
         auto& graph_vertex = bcp_graph_.graph_.get_vertex(vertex_id);
         changed_class_info_[class_descriptor] = graph_vertex.GetChanges();
         collected_classes++;
@@ -1612,7 +1612,7 @@ class BcpDependencyGraphPropagator : public DependencyGraphPropagator {
   }
 
   // Getter for changed class info (used by app dependency graph propagator)
-  const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& GetChangedClassInfo() const {
+  const std::unordered_map<std::string_view, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& GetChangedClassInfo() const {
     return changed_class_info_;
   }
 };
@@ -1623,7 +1623,7 @@ class BcpMethodDependencyGraphPropagator {
  public:
   BcpMethodDependencyGraphPropagator(
       DependencyGraph* bcp_method_graph,
-      const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info)
+      const std::unordered_map<std::string_view, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info)
       : bcp_method_graph_(*bcp_method_graph), changed_class_info_(changed_class_info) {}
 
   // Set initial changes on BCP method graph based on changed BCP classes.
@@ -1642,7 +1642,7 @@ class BcpMethodDependencyGraphPropagator {
         continue;
       }
 
-      const std::string& class_descriptor = vertex.GetDescriptor();
+      const std::string_view class_descriptor = vertex.GetDescriptor();
       auto it = changed_class_info_.find(class_descriptor);
       if (it != changed_class_info_.end()) {
         auto& graph_vertex = bcp_method_graph_.graph_.get_vertex(vertex_id);
@@ -1707,7 +1707,7 @@ class BcpMethodDependencyGraphPropagator {
 
  private:
   DependencyGraph& bcp_method_graph_;
-  const std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info_;
+  const std::unordered_map<std::string_view, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>>& changed_class_info_;
 };
 
 class OatFileAnalyzer {
@@ -1858,9 +1858,9 @@ class OatFileAnalyzer {
 
 class InlineCallGraphNode {
  public:
-  InlineCallGraphNode(const std::string& descriptor, bool is_effected) : descriptor_(descriptor), is_effected_(is_effected) {}
+  InlineCallGraphNode(const std::string_view descriptor, bool is_effected) : descriptor_(descriptor), is_effected_(is_effected) {}
 
-  const std::string& GetDescriptor() const { return descriptor_; }
+  const std::string_view GetDescriptor() const { return descriptor_; }
   bool IsEffected() const { return is_effected_; }
   void SetEffected(bool is_effected) { is_effected_ = is_effected; }  
  private:
@@ -1931,7 +1931,7 @@ class InlineDependencyExpander {
         if (!original_dep_graph_.graph_.has_vertex(vertex_b_id)) {
           DexSymId bcp_method_symid(vertex_b_id);
           const InlineCallGraphNode& vertex_b = inline_graph_.graph_.get_vertex(vertex_b_id);
-          std::string method_name = vertex_b.GetDescriptor();
+          std::string_view method_name = vertex_b.GetDescriptor();
           expanded_graph->AddVertexIfAbsent(bcp_method_symid, method_name, false);  // is_changed=false
           expanded_graph->UpdateEdge(bcp_method_symid, DexSymId(vertex_a_id), std::bitset<3>(7));
           // B has no predecessors in original graph, so no C → B edges to propagate
@@ -2043,7 +2043,7 @@ class InlineCallGraphBuilder {
           }
           uint32_t dex_method_idx = method.GetIndex();
           DexSymId caller_dex_sym_id(i, true, dex_method_idx);
-          std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
+          std::string_view caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
           //if (caller_method_name.find("org.bouncycastle.cert.X509CertificateHolder.get") != std::string::npos) {
             //std::cout<<caller_method_name<<"\n"; 
             //PrintDexBytecode(method);
@@ -2057,7 +2057,7 @@ class InlineCallGraphBuilder {
   bool AnalyzeOatMethod(const OatQuickMethodHeader* caller_header, const DexSymId caller_dex_sym_id, uint32_t offset) {
     bool should_print_inline_dex = false;
     CodeInfo code_info(caller_header);
-    std::string caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
+    std::string_view caller_method_name = graph_.graph_.get_vertex(caller_dex_sym_id.id).GetDescriptor();
     //if (caller_method_name.find("org.bouncycastle.cert.X509CertificateHolder.get") != std::string::npos) {
       //should_print_inline_dex = true;
     //}
@@ -2335,7 +2335,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     TypeIdChanges type_id_changes;
 
     // Changed class info for app dependency graph - populated when BCP diff is enabled
-    std::unordered_map<std::string, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info;
+    std::unordered_map<std::string_view, std::bitset<static_cast<size_t>(DependencyType::kDependencyTypeCount)>> changed_class_info;
     std::vector<std::unique_ptr<const art::DexFile>> original_bcp_dex_files;
 
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
@@ -2538,13 +2538,13 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         // Collect AOT-invalidated methods and affected classes
         size_t aot_invalidated_methods = 0;
         size_t aot_affected_classes = 0;
-        std::vector<std::string> aot_invalidated_method_names;
-        std::vector<std::pair<std::string, std::bitset<3>>> affected_class_details;
+        std::vector<std::string_view> aot_invalidated_method_names;
+        std::vector<std::pair<std::string_view, std::bitset<3>>> affected_class_details;
         for (const auto& [vertex_id, vertex] : graph.GetVertices()) {
           if (vertex.IsChanged()) {
             DexSymId sym_id(vertex_id);
             if (!sym_id.IsClass()) {
-              const std::string& method_name = vertex.GetDescriptor();
+              const std::string_view method_name = vertex.GetDescriptor();
               if (compiled_methods->find(vertex_id) == compiled_methods->end()) continue;
               aot_invalidated_methods++;
               aot_invalidated_method_names.push_back(vertex.GetDescriptor());

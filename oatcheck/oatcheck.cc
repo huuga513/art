@@ -15,6 +15,7 @@
  */
 
 #include <bitset>
+#include <chrono>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -2597,6 +2598,12 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
 int main(int argc, char** argv) {
   android::base::SetLogger(android::base::StderrLogger);
+  auto start_time = std::chrono::steady_clock::now();
   OatCheckMain main_runner;
-  return main_runner.Main(argc, argv);
+  int result = main_runner.Main(argc, argv);
+  auto end_time = std::chrono::steady_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+  double duration_s = duration.count() / 1000.0;
+  std::cout << "Total execution time: " << duration_s << " s" << std::endl;
+  return result;
 }

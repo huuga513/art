@@ -2423,7 +2423,25 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
     }
 
+    // Build BCP method dependency graph and propagate to get affected BCP methods
+    LOG(INFO) << "Building BCP method dependency graph for method change analysis...";
+
+    // Use heap allocation to reduce stack usage
+    std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
+    BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_dex_files, bcp_method_graph.get(), &interface_method_changes, &string_id_changes, &type_id_changes);
+    if (!bcp_method_builder.BuildGraph(&error_msg)) {
+      LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
+      return false;
+    }
+
+    BcpMethodDependencyGraphPropagator bcp_method_propagator(bcp_method_graph.get(), changed_class_info);
+    bcp_method_propagator.SetInitialChangesFromBcpClassChanges();
+    bcp_method_propagator.PropagateChanges();
+    auto affected_bcp_methods = bcp_method_propagator.CollectAffectedBcpMethods();
+    for (auto& affected_bcp_method: affected_bcp_methods) affected_bcp_method.SetIsBcpDex(true);
+
     // Load app dex files from APK first (before line 2490)
+    auto processing_start_time = std::chrono::steady_clock::now();
     std::vector<std::unique_ptr<const art::DexFile>> app_dex_files;
     if (args_->apk_file_ != nullptr) {
       art::DexFileLoader loader(args_->apk_file_, args_->apk_file_);
@@ -2510,24 +2528,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         LOG(INFO) << "Setting initial changes from BCP diff on expanded dependency graph...";
         DependencyGraphPropagator propagator(&graph);
         propagator.SetInitialChangesFromBcp(changed_class_info);
-
-        // Build BCP method dependency graph and propagate to get affected BCP methods
-        LOG(INFO) << "Building BCP method dependency graph for method change analysis...";
-
-        // Use heap allocation to reduce stack usage
-        std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
-        BcpMethodDependencyGraphBuilder bcp_method_builder(original_bcp_dex_files, bcp_method_graph.get(), &interface_method_changes, &string_id_changes, &type_id_changes);
-        if (!bcp_method_builder.BuildGraph(&error_msg)) {
-          LOG(ERROR) << "Failed to build BCP method dependency graph: " << error_msg;
-          return false;
-        }
-
-        BcpMethodDependencyGraphPropagator bcp_method_propagator(bcp_method_graph.get(), changed_class_info);
-        bcp_method_propagator.SetInitialChangesFromBcpClassChanges();
-        bcp_method_propagator.PropagateChanges();
-        auto affected_bcp_methods = bcp_method_propagator.CollectAffectedBcpMethods();
-        for (auto& affected_bcp_method: affected_bcp_methods) affected_bcp_method.SetIsBcpDex(true);
-
         // Set initial changes from BCP methods on app graph
         LOG(INFO) << "Setting initial changes from affected BCP methods...";
         propagator.SetInitialChangesFromBcpMethods(affected_bcp_methods);
@@ -2591,6 +2591,11 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     if (args_->updated_bcp_prefix_)
       std::cout << "Updated BCP prefix: " << args_->updated_bcp_prefix_ << "\n";
 
+    auto processing_end_time = std::chrono::steady_clock::now();
+    auto processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end_time - processing_start_time);
+    double processing_duration_s = processing_duration.count() / 1000.0;
+    std::cout << "Processing time: " << processing_duration_s << " s" << std::endl;
+
     *os << "Done.\n";
     return true;
   }
@@ -2598,12 +2603,6 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
 
 int main(int argc, char** argv) {
   android::base::SetLogger(android::base::StderrLogger);
-  auto start_time = std::chrono::steady_clock::now();
   OatCheckMain main_runner;
-  int result = main_runner.Main(argc, argv);
-  auto end_time = std::chrono::steady_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-  double duration_s = duration.count() / 1000.0;
-  std::cout << "Total execution time: " << duration_s << " s" << std::endl;
-  return result;
+  return main_runner.Main(argc, argv);
 }

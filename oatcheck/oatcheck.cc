@@ -938,7 +938,7 @@ class InlineCallGraphNode {
  public:
   InlineCallGraphNode(const std::string_view descriptor, bool is_effected) : descriptor_(descriptor), is_effected_(is_effected) {}
 
-  const std::string_view GetDescriptor() const { return descriptor_; }
+  const std::string& GetDescriptor() const { return descriptor_; }
   bool IsEffected() const { return is_effected_; }
   void SetEffected(bool is_effected) { is_effected_ = is_effected; }  
  private:

@@ -6,4 +6,5 @@ import art_host
 if __name__ == "__main__":
     aosp_root = "/ssd2/wyz/AOSP"
     app = "out/host/linux-x86/bin/oatcheck"
+    #art_host.run_host(app, aosp_root, "perf", *sys.argv[1:])
     art_host.run_host(app, aosp_root, "", *sys.argv[1:])

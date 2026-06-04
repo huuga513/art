@@ -64,6 +64,23 @@
 #include "scoped_thread_state_change-inl.h"
 using namespace art;
 
+class ScopedTimer {
+ public:
+  explicit ScopedTimer(const std::string& name) : name_(name), start_(std::chrono::steady_clock::now()) {}
+  void start() {
+    start_ = std::chrono::steady_clock::now();
+  }
+  void end() {
+    auto end = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration<double>(end - start_).count();
+    LOG(INFO) << name_ << " " << duration << "s";
+  }
+
+ private:
+  std::string name_;
+  std::chrono::steady_clock::time_point start_;
+};
+
 static std::vector<std::unique_ptr<const art::DexFile>>* g_bcp_dex_files;
 static std::vector<std::unique_ptr<const art::DexFile>>* g_app_dex_files;
 // Builds full JAR paths from a directory prefix and a vector of relative jar paths.
@@ -2336,6 +2353,7 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     if (args_->verbose_) {
       LOG(INFO) << "Verbose mode enabled";
     }
+    auto bcp_diffing_start_time = std::chrono::steady_clock::now();
 
     std::string error_msg;
     std::ostream* os = &std::cout;
@@ -2352,6 +2370,8 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     if (args_->origin_bcp_prefix_ != nullptr && args_->updated_bcp_prefix_ != nullptr) {
       LOG(INFO) << "Starting BCP change detection...";
 
+      ScopedTimer build_bcp_graph_timer("Build bcp graph");
+      build_bcp_graph_timer.start();
       // Build original BCP JAR paths
       std::vector<std::string> original_paths_storage = BuildJarPaths(
           args_->origin_bcp_prefix_, kBootClasspathJars);
@@ -2370,7 +2390,10 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
         return false;
       }
       LOG(INFO) << "Original BCP graph built: " << original_bcp_graph->Summary();
+      build_bcp_graph_timer.end();
 
+      ScopedTimer initial_change_timer("Bcp initial change");
+      initial_change_timer.start();
       // Load updated BCP DEX files
       std::vector<std::unique_ptr<const art::DexFile>> updated_boot_dex_files;
       std::vector<std::string> updated_paths = BuildJarPaths(
@@ -2431,10 +2454,13 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
       *os << "  Changed classes: " << changed_classes << "\n";
       *os << "  Changed methods: " << changed_methods << "\n";
       *os << "  Total affected nodes: " << changed_classes + changed_methods << "\n";
+      initial_change_timer.end();
     }
 
     // Build BCP method dependency graph and propagate to get affected BCP methods
     LOG(INFO) << "Building BCP method dependency graph for method change analysis...";
+    ScopedTimer bcp_method_detect_timer("Bcp method detect timer");
+    bcp_method_detect_timer.start();
 
     // Use heap allocation to reduce stack usage
     std::unique_ptr<DependencyGraph> bcp_method_graph = std::make_unique<DependencyGraph>();
@@ -2449,6 +2475,12 @@ struct OatCheckMain : public CmdlineMain<OatCheckArgs> {
     bcp_method_propagator.PropagateChanges();
     auto affected_bcp_methods = bcp_method_propagator.CollectAffectedBcpMethods();
     for (auto& affected_bcp_method: affected_bcp_methods) affected_bcp_method.SetIsBcpDex(true);
+    bcp_method_detect_timer.end();
+
+    auto bcp_diffing_end_time = std::chrono::steady_clock::now();
+    auto bcp_diffing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        bcp_diffing_end_time - bcp_diffing_start_time);
+    LOG(INFO) << "BCP diffing time: " << (bcp_diffing_duration.count() / 1000.0) << " s";
 
     // Load app dex files from APK first (before line 2490)
     auto processing_start_time = std::chrono::steady_clock::now();
